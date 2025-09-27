@@ -1,14 +1,14 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64},
     Arc,
 };
-use std::time::Duration;
 
 use clap::Parser;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use tanimist_core::video::TypstVideoRenderer;
+use tanimist_cli::video::TypstVideoRenderer;
 use tinymist_world::args::CompileOnceArgs;
 use tracing::info;
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use typst::foundations::{Dict, Str, Value};
 
 #[derive(Debug, Clone, Parser, Default)]
@@ -25,7 +25,7 @@ pub struct Args {
 
 #[derive(Debug, Clone, Parser, Default)]
 pub struct EncoderArgs {
-    #[clap(long, default_value = "nvenc_hevc")]
+    #[clap(long, default_value = "libx264")]
     pub codec: String,
     /// Constant Rate Factor (CRF) for quality control (lower is better quality, range 0-51)
     #[clap(long)]
@@ -36,12 +36,14 @@ pub struct EncoderArgs {
 
 fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
-    tracing_subscriber::fmt::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_env_filter("tanimist_core=info,video_rs=warn,ffmpeg=error")
-        .with_thread_ids(true)
-        .with_thread_names(true)
-        .compact()
+    let indicatif_layer = IndicatifLayer::new();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
+        .with(indicatif_layer)
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "tanimist_core=info,video_rs=warn,ffmpeg=error".into()),
+        )
         .init();
     let args = Args::parse();
     let univ = match args.compile_once.resolve_system() {
@@ -74,53 +76,6 @@ fn main() -> anyhow::Result<()> {
     let encode_progress = Arc::new(AtomicU64::new(0));
     let error_signal = Arc::new(AtomicBool::new(false));
 
-    let m = MultiProgress::new();
-    let sty = ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
-    )
-    .unwrap()
-    .progress_chars("##-");
-
-    let pb_render = m.add(ProgressBar::new(total_frames));
-    pb_render.set_style(sty.clone());
-    pb_render.set_message("rendering");
-
-    let pb_encode = m.add(ProgressBar::new(total_frames));
-    pb_encode.set_style(sty);
-    pb_encode.set_message("encoding");
-
-    let progress_thread = {
-        let render_progress = render_progress.clone();
-        let encode_progress = encode_progress.clone();
-        let error_signal = error_signal.clone();
-        std::thread::Builder::new()
-            .name("progress".to_string())
-            .spawn(move || {
-                while pb_render.position() < total_frames || pb_encode.position() < total_frames {
-                    if error_signal.load(Ordering::SeqCst) {
-                        pb_render.abandon_with_message("rendering failed");
-                        pb_encode.abandon_with_message("encoding failed");
-                        break;
-                    }
-
-                    let render_pos = render_progress.load(Ordering::SeqCst);
-                    pb_render.set_position(render_pos);
-                    if render_pos == total_frames {
-                        pb_render.finish_with_message("rendered");
-                    }
-
-                    let encode_pos = encode_progress.load(Ordering::SeqCst);
-                    pb_encode.set_position(encode_pos);
-                    if encode_pos == total_frames {
-                        pb_encode.finish_with_message("encoded");
-                    }
-
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            })
-            .unwrap()
-    };
-
     let render_thread = std::thread::Builder::new()
         .name("render".to_string())
         .spawn(move || {
@@ -138,11 +93,9 @@ fn main() -> anyhow::Result<()> {
     let data = match render_thread.join().unwrap() {
         Ok(data) => data,
         Err(e) => {
-            m.clear()?;
             return Err(e.into());
         }
     };
-    progress_thread.join().unwrap();
     std::fs::write(&args.output, data)?;
     info!("Finished in {:?}", start.elapsed());
     info!("Wrote output to {}", args.output);

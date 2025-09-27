@@ -1,19 +1,21 @@
 use crossbeam::channel;
+use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array3;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
     path::PathBuf,
     sync::{
-        Arc, Once,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Once,
     },
     thread,
 };
 use thiserror::Error;
 use tiny_skia::Pixmap;
 use tinymist_world::{TaskInputs, TypstSystemUniverse};
-use tracing::{info, instrument};
+use tracing::{debug_span, info, info_span, instrument, Span};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 use typst::{diag::SourceDiagnostic, foundations::Dict, layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
 use video_rs::{Encoder, Location, Time};
@@ -76,7 +78,7 @@ impl TypstVideoRenderer {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self))]
     fn render_frame(&self, t: i32) -> Result<tiny_skia::Pixmap, Error> {
         let world = self.universe.snapshot_with(Some(TaskInputs {
             entry: None,
@@ -89,7 +91,7 @@ impl TypstVideoRenderer {
         Ok(render(frame, self.ppi / 72.0))
     }
 
-    #[instrument]
+    #[instrument(level = "debug", skip(pixmap))]
     fn process_frame(pixmap: Pixmap) -> Result<Array3<u8>, Error> {
         let width = pixmap.width();
         let height = pixmap.height();
@@ -127,16 +129,37 @@ impl TypstVideoRenderer {
         )?)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self))]
     pub fn render(
         self,
         begin_t: i32,
         end_t: i32,
         fps: i32,
-        render_progress: Option<Arc<AtomicU64>>,
-        encode_progress: Option<Arc<AtomicU64>>,
+        _render_progress: Option<Arc<AtomicU64>>,
+        _encode_progress: Option<Arc<AtomicU64>>,
         error_signal: Arc<AtomicBool>,
     ) -> Result<Vec<u8>, Error> {
+        let root_span = debug_span!("render");
+        let rendering_span = info_span!("rendering");
+        let encoding_span = info_span!("encoding");
+        let _enter = root_span.enter();
+
+        let sty = ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-");
+
+        let total_frames = (end_t - begin_t) as u64;
+
+        rendering_span.pb_set_length(total_frames);
+        rendering_span.pb_set_style(&sty);
+        rendering_span.pb_set_message("rendering");
+
+        encoding_span.pb_set_length(total_frames);
+        encoding_span.pb_set_style(&sty);
+        encoding_span.pb_set_message("encoding");
+
         let stop_signal = Arc::new(AtomicBool::new(false));
         static FFMPEG_INIT: Once = Once::new();
         FFMPEG_INIT.call_once(|| {
@@ -157,31 +180,9 @@ impl TypstVideoRenderer {
 
         let mut file = tempfile::Builder::new().suffix(".mp4").tempfile()?;
         let output_path = file.path().to_owned();
-        let encode_thread = {
-            let ffmpeg_options = self.ffmpeg_options.clone();
-            let stop_signal = stop_signal.clone();
-            let error_signal = error_signal.clone();
-            thread::Builder::new()
-                .name("encoder".to_string())
-                .spawn(move || {
-                    Self::encode_video(
-                        frame_rx,
-                        width,
-                        height,
-                        fps,
-                        &output_path.to_string_lossy(),
-                        begin_t,
-                        encode_progress,
-                        ffmpeg_options,
-                        stop_signal,
-                        error_signal,
-                    )
-                })
-                .unwrap()
-        };
-
         let self_arc = std::sync::Arc::new(self);
         let num_workers = (num_cpus::get() - 2).max(1);
+        let _re =rendering_span.enter();
         let workers: Vec<_> = (0..num_workers)
             .map(|i| {
                 let task_rx = task_rx.clone();
@@ -189,8 +190,7 @@ impl TypstVideoRenderer {
                 let self_clone = self_arc.clone();
                 let stop_signal = stop_signal.clone();
                 let error_signal = error_signal.clone();
-
-                let render_progress = render_progress.clone();
+                let pb_render = rendering_span.clone();
                 thread::Builder::new()
                     .name(format!("worker-{i}"))
                     .spawn(move || {
@@ -198,7 +198,7 @@ impl TypstVideoRenderer {
                             if stop_signal.load(Ordering::SeqCst) {
                                 break;
                             }
-                            let _span = tracing::info_span!("worker_frame", t = t).entered();
+                            let _span = tracing::debug_span!("worker_frame", t = t).entered();
                             match self_clone.render_frame(t) {
                                 Ok(pixmap) => match Self::process_frame(pixmap) {
                                     Ok(frame) => {
@@ -207,9 +207,7 @@ impl TypstVideoRenderer {
                                             break;
                                         }
                                         if !stop_signal.load(Ordering::SeqCst) {
-                                            if let Some(p) = &render_progress {
-                                                p.fetch_add(1, Ordering::SeqCst);
-                                            }
+                                            pb_render.pb_inc(1);
                                         }
                                     }
                                     Err(e) => {
@@ -231,6 +229,32 @@ impl TypstVideoRenderer {
                     .unwrap()
             })
             .collect();
+        let _e = encoding_span.enter();
+        let encode_thread = {
+            let ffmpeg_options = self_arc.ffmpeg_options.clone();
+            let stop_signal = stop_signal.clone();
+            let error_signal = error_signal.clone();
+            let encoding_span = encoding_span.clone();
+            thread::Builder::new()
+                .name("encoder".to_string())
+                .spawn(move || {
+                    Self::encode_video(
+                        frame_rx,
+                        width,
+                        height,
+                        fps,
+                        &output_path.to_string_lossy(),
+                        begin_t,
+                        Some(encoding_span),
+                        ffmpeg_options,
+                        stop_signal,
+                        error_signal,
+                    )
+                })
+                .unwrap()
+        };
+
+        
 
         for t in begin_t..end_t {
             if stop_signal.load(Ordering::SeqCst) {
@@ -278,7 +302,7 @@ impl TypstVideoRenderer {
         .map_err(Error::Io)
     }
 
-    #[instrument(skip_all, fields(output_path = %output_path))]
+    #[instrument(level = "debug", skip_all, fields(output_path = %output_path))]
     fn encode_video(
         rx: channel::Receiver<(i32, Array3<u8>)>,
         width: u32,
@@ -286,7 +310,7 @@ impl TypstVideoRenderer {
         fps: i32,
         output_path: &str,
         begin_t: i32,
-        encode_progress: Option<Arc<AtomicU64>>,
+        encode_progress: Option<Span>,
         ffmpeg_options: HashMap<String, String>,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
@@ -307,7 +331,7 @@ impl TypstVideoRenderer {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
             }
-            let _span = tracing::info_span!("encoder_recv", frame_num = frame_num).entered();
+            let _span = tracing::debug_span!("encoder_recv", frame_num = frame_num).entered();
             received_frames.insert(frame_num, frame);
             while let Some(frame) = received_frames.remove(&next_expected) {
                 if stop_signal.load(Ordering::SeqCst) {
@@ -315,7 +339,7 @@ impl TypstVideoRenderer {
                 }
                 let timestamp = Time::from_secs((next_expected - begin_t) as f32 / fps as f32);
                 let _encode_span =
-                    tracing::info_span!("encode_frame", frame_num = next_expected).entered();
+                    tracing::debug_span!("encode_frame", frame_num = next_expected).entered();
                 if let Err(e) = encoder.encode(&frame, timestamp) {
                     stop_signal.store(true, Ordering::SeqCst);
                     error_signal.store(true, Ordering::SeqCst);
@@ -323,7 +347,7 @@ impl TypstVideoRenderer {
                 }
                 if !stop_signal.load(Ordering::SeqCst) {
                     if let Some(p) = &encode_progress {
-                        p.fetch_add(1, Ordering::SeqCst);
+                        p.pb_inc(1);
                     }
                 }
                 drop(_encode_span);
@@ -336,7 +360,7 @@ impl TypstVideoRenderer {
             while let Some(frame) = received_frames.remove(&next_expected) {
                 let timestamp = Time::from_secs((next_expected - begin_t) as f32 / fps as f32);
                 let _encode_span =
-                    tracing::info_span!("encode_remaining_frame", frame_num = next_expected)
+                    tracing::debug_span!("encode_remaining_frame", frame_num = next_expected)
                         .entered();
                 if let Err(e) = encoder.encode(&frame, timestamp) {
                     stop_signal.store(true, Ordering::SeqCst);
@@ -344,7 +368,7 @@ impl TypstVideoRenderer {
                     return Err(e.into());
                 }
                 if let Some(p) = &encode_progress {
-                    p.fetch_add(1, Ordering::SeqCst);
+                    p.pb_inc(1);
                 }
                 drop(_encode_span);
                 next_expected += 1;

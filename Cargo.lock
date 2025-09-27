@@ -1642,6 +1642,7 @@ dependencies = [
  "portable-atomic",
  "unicode-width 0.2.1",
  "unit-prefix",
+ "vt100",
  "web-time",
 ]
 
@@ -3159,7 +3160,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tanimist-core"
+name = "tanimist-cli"
 version = "0.13.1"
 dependencies = [
  "anyhow",
@@ -3173,6 +3174,7 @@ dependencies = [
  "tiny-skia",
  "tinymist-world",
  "tracing",
+ "tracing-indicatif",
  "tracing-subscriber",
  "typst",
  "typst-render",
@@ -3620,6 +3622,18 @@ checksum = "b9d12581f227e93f094d3af2ae690a574abb8a2b9b7a96e7cfe9647b2b617678"
 dependencies = [
  "once_cell",
  "valuable",
+]
+
+[[package]]
+name = "tracing-indicatif"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d4e11e0e27acef25a47f27e9435355fecdc488867fa2bc90e75b0700d2823d"
+dependencies = [
+ "indicatif",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4176,6 +4190,39 @@ dependencies = [
  "ndarray",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "vt100"
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84cd863bf0db7e392ba3bd04994be3473491b31e66340672af5d11943c6274de"
+dependencies = [
+ "itoa",
+ "log",
+ "unicode-width 0.1.14",
+ "vte",
+]
+
+[[package]]
+name = "vte"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5022b5fbf9407086c180e9557be968742d839e68346af7792b8592489732197"
+dependencies = [
+ "arrayvec",
+ "utf8parse",
+ "vte_generate_state_changes",
+]
+
+[[package]]
+name = "vte_generate_state_changes"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e369bee1b05d510a7b4ed645f5faa90619e05437111783ea5848f28d97d3c2e"
+dependencies = [
+ "proc-macro2",
+ "quote",
 ]
 
 [[package]]
