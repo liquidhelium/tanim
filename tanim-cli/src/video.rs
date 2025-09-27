@@ -1,7 +1,6 @@
 use crossbeam::channel;
 use indicatif::ProgressStyle;
 use ndarray::Array3;
-use zstd;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
@@ -201,17 +200,10 @@ impl TypstVideoRenderer {
                             match self_clone.render_frame(t) {
                                 Ok(pixmap) => match Self::process_frame(pixmap) {
                                     Ok(frame) => {
-                                        let compressed_frame =
-                                            match zstd::encode_all(frame.as_slice().unwrap(), 0) {
-                                                Ok(f) => f,
-                                                Err(e) => {
-                                                    tracing::error!("Error compressing frame {t}: {e}");
-                                                    stop_signal.store(true, Ordering::SeqCst);
-                                                    error_signal.store(true, Ordering::SeqCst);
-                                                    break;
-                                                }
-                                            };
-                                        if frame_tx.send((t, compressed_frame)).is_err() {
+                                        if frame_tx
+                                            .send((t, frame.into_raw_vec()))
+                                            .is_err()
+                                        {
                                             // Encoder thread has likely panicked, stop sending.
                                             break;
                                         }
@@ -341,23 +333,12 @@ impl TypstVideoRenderer {
             }
             let _span = tracing::debug_span!("encoder_recv", frame_num = frame_num).entered();
             received_frames.insert(frame_num, frame);
-            while let Some(compressed_frame) = received_frames.remove(&next_expected) {
+            while let Some(raw_frame) = received_frames.remove(&next_expected) {
                 if stop_signal.load(Ordering::SeqCst) {
                     break;
                 }
-                let decompressed_frame = match zstd::decode_all(compressed_frame.as_slice()) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!("Error decompressing frame {next_expected}: {e}");
-                        stop_signal.store(true, Ordering::SeqCst);
-                        error_signal.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                };
-                let frame = Array3::from_shape_vec(
-                    (height as usize, width as usize, 3),
-                    decompressed_frame,
-                )?;
+                let frame =
+                    Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
                 let timestamp = Time::from_secs((next_expected - begin_t) as f32 / fps as f32);
                 let _encode_span =
                     tracing::debug_span!("encode_frame", frame_num = next_expected).entered();
@@ -378,20 +359,9 @@ impl TypstVideoRenderer {
 
         if !stop_signal.load(Ordering::SeqCst) {
             // After the channel is closed, process any remaining frames in the map.
-            while let Some(compressed_frame) = received_frames.remove(&next_expected) {
-                let decompressed_frame = match zstd::decode_all(compressed_frame.as_slice()) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!("Error decompressing frame {next_expected}: {e}");
-                        stop_signal.store(true, Ordering::SeqCst);
-                        error_signal.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                };
-                let frame = Array3::from_shape_vec(
-                    (height as usize, width as usize, 3),
-                    decompressed_frame,
-                )?;
+            while let Some(raw_frame) = received_frames.remove(&next_expected) {
+                let frame =
+                    Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
                 let timestamp = Time::from_secs((next_expected - begin_t) as f32 / fps as f32);
                 let _encode_span =
                     tracing::debug_span!("encode_remaining_frame", frame_num = next_expected)

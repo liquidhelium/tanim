@@ -20,4 +20,3 @@ anyhow = "1.0.100"
 indicatif = "0.18.0"
 tracing-indicatif = "0.3.1"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "registry"] }
-zstd = "0.13.1"
