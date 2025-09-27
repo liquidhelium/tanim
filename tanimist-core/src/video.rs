@@ -4,7 +4,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
     path::PathBuf,
-    sync::{Arc, Once},
+    sync::{
+        Arc, Once,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
 };
 use thiserror::Error;
@@ -34,6 +37,9 @@ pub enum Error {
 
     #[error("Failed to send frame to encoder thread")]
     FrameSendError,
+
+    #[error("Rendering or encoding failed")]
+    RenderOrEncode,
 
     #[error("Failed to send task to worker thread")]
     TaskSendError,
@@ -127,9 +133,11 @@ impl TypstVideoRenderer {
         begin_t: i32,
         end_t: i32,
         fps: i32,
-        render_progress: Option<channel::Sender<()>>,
-        encode_progress: Option<channel::Sender<()>>,
+        render_progress: Option<Arc<AtomicU64>>,
+        encode_progress: Option<Arc<AtomicU64>>,
+        error_signal: Arc<AtomicBool>,
     ) -> Result<Vec<u8>, Error> {
+        let stop_signal = Arc::new(AtomicBool::new(false));
         static FFMPEG_INIT: Once = Once::new();
         FFMPEG_INIT.call_once(|| {
             video_rs::init().unwrap();
@@ -151,21 +159,25 @@ impl TypstVideoRenderer {
         let output_path = file.path().to_owned();
         let encode_thread = {
             let ffmpeg_options = self.ffmpeg_options.clone();
+            let stop_signal = stop_signal.clone();
+            let error_signal = error_signal.clone();
             thread::Builder::new()
                 .name("encoder".to_string())
                 .spawn(move || {
                     Self::encode_video(
                         frame_rx,
                         width,
-                    height,
-                    fps,
-                    &output_path.to_string_lossy(),
-                    begin_t,
-                    encode_progress,
-                    ffmpeg_options,
-                )
-            })
-            .unwrap()
+                        height,
+                        fps,
+                        &output_path.to_string_lossy(),
+                        begin_t,
+                        encode_progress,
+                        ffmpeg_options,
+                        stop_signal,
+                        error_signal,
+                    )
+                })
+                .unwrap()
         };
 
         let self_arc = std::sync::Arc::new(self);
@@ -175,44 +187,58 @@ impl TypstVideoRenderer {
                 let task_rx = task_rx.clone();
                 let frame_tx = frame_tx.clone();
                 let self_clone = self_arc.clone();
+                let stop_signal = stop_signal.clone();
+                let error_signal = error_signal.clone();
 
                 let render_progress = render_progress.clone();
                 thread::Builder::new()
-                    .name(format!("worker-{}", i))
+                    .name(format!("worker-{i}"))
                     .spawn(move || {
                         while let Ok(t) = task_rx.recv() {
+                            if stop_signal.load(Ordering::SeqCst) {
+                                break;
+                            }
                             let _span = tracing::info_span!("worker_frame", t = t).entered();
                             match self_clone.render_frame(t) {
-                            Ok(pixmap) => {
-                                match Self::process_frame(pixmap) {
+                                Ok(pixmap) => match Self::process_frame(pixmap) {
                                     Ok(frame) => {
                                         if frame_tx.send((t, frame)).is_err() {
                                             // Encoder thread has likely panicked, stop sending.
                                             break;
                                         }
-                                        if let Some(p) = &render_progress
-                                            && p.send(()).is_err()
-                                        {
-                                            // Progress receiver has been dropped, stop sending.
+                                        if !stop_signal.load(Ordering::SeqCst) {
+                                            if let Some(p) = &render_progress {
+                                                p.fetch_add(1, Ordering::SeqCst);
+                                            }
                                         }
                                     }
-                                    Err(e) => panic!("Error processing frame {t}: {e}"),
+                                    Err(e) => {
+                                        tracing::error!("Error processing frame {t}: {e}");
+                                        stop_signal.store(true, Ordering::SeqCst);
+                                        error_signal.store(true, Ordering::SeqCst);
+                                        break;
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::error!("Error rendering frame {t}: {e}");
+                                    stop_signal.store(true, Ordering::SeqCst);
+                                    error_signal.store(true, Ordering::SeqCst);
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                panic!("Error rendering frame {t}: {e}");
-                            }
                         }
-                    }
-                })
-                .unwrap()
+                    })
+                    .unwrap()
             })
             .collect();
 
         for t in begin_t..end_t {
+            if stop_signal.load(Ordering::SeqCst) {
+                break;
+            }
             if task_tx.send(t).is_err() {
                 // All workers have panicked or exited, no point in sending more tasks.
-                return Err(Error::TaskSendError);
+                break;
             }
         }
 
@@ -237,7 +263,12 @@ impl TypstVideoRenderer {
                     .unwrap_or_else(|| "Unknown panic in encoder thread".to_string()),
             )
         })?;
-        encode_result?; // Propagate errors from inside the encode thread
+
+        // Propagate errors from inside the encode thread
+        encode_result?;
+        if stop_signal.load(Ordering::SeqCst) {
+            return Err(Error::RenderOrEncode);
+        }
 
         {
             let mut buf = vec![];
@@ -255,8 +286,10 @@ impl TypstVideoRenderer {
         fps: i32,
         output_path: &str,
         begin_t: i32,
-        encode_progress: Option<channel::Sender<()>>,
+        encode_progress: Option<Arc<AtomicU64>>,
         ffmpeg_options: HashMap<String, String>,
+        stop_signal: Arc<AtomicBool>,
+        error_signal: Arc<AtomicBool>,
     ) -> Result<(), Error> {
         info!("using ffmpeg options: {ffmpeg_options:?}");
         let settings = video_rs::encode::Settings::preset_h264_custom(
@@ -271,39 +304,58 @@ impl TypstVideoRenderer {
         let mut next_expected = begin_t;
 
         for (frame_num, frame) in rx {
+            if stop_signal.load(Ordering::SeqCst) {
+                break;
+            }
             let _span = tracing::info_span!("encoder_recv", frame_num = frame_num).entered();
             received_frames.insert(frame_num, frame);
             while let Some(frame) = received_frames.remove(&next_expected) {
+                if stop_signal.load(Ordering::SeqCst) {
+                    break;
+                }
                 let timestamp = Time::from_secs((next_expected - begin_t) as f32 / fps as f32);
                 let _encode_span =
                     tracing::info_span!("encode_frame", frame_num = next_expected).entered();
-                encoder.encode(&frame, timestamp)?;
-                if let Some(p) = &encode_progress
-                    && p.send(()).is_err()
-                {
-                    // Progress receiver has been dropped, stop sending.
+                if let Err(e) = encoder.encode(&frame, timestamp) {
+                    stop_signal.store(true, Ordering::SeqCst);
+                    error_signal.store(true, Ordering::SeqCst);
+                    return Err(e.into());
+                }
+                if !stop_signal.load(Ordering::SeqCst) {
+                    if let Some(p) = &encode_progress {
+                        p.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
                 drop(_encode_span);
                 next_expected += 1;
             }
         }
 
-        // After the channel is closed, process any remaining frames in the map.
-        while let Some(frame) = received_frames.remove(&next_expected) {
-            let timestamp = Time::from_secs((next_expected - begin_t) as f32 / fps as f32);
-            let _encode_span =
-                tracing::info_span!("encode_remaining_frame", frame_num = next_expected).entered();
-            encoder.encode(&frame, timestamp)?;
-            if let Some(p) = &encode_progress
-                && p.send(()).is_err()
-            {
-                // Progress receiver has been dropped, stop sending.
+        if !stop_signal.load(Ordering::SeqCst) {
+            // After the channel is closed, process any remaining frames in the map.
+            while let Some(frame) = received_frames.remove(&next_expected) {
+                let timestamp = Time::from_secs((next_expected - begin_t) as f32 / fps as f32);
+                let _encode_span =
+                    tracing::info_span!("encode_remaining_frame", frame_num = next_expected)
+                        .entered();
+                if let Err(e) = encoder.encode(&frame, timestamp) {
+                    stop_signal.store(true, Ordering::SeqCst);
+                    error_signal.store(true, Ordering::SeqCst);
+                    return Err(e.into());
+                }
+                if let Some(p) = &encode_progress {
+                    p.fetch_add(1, Ordering::SeqCst);
+                }
+                drop(_encode_span);
+                next_expected += 1;
             }
-            drop(_encode_span);
-            next_expected += 1;
         }
 
-        encoder.finish()?;
+        if let Err(e) = encoder.finish() {
+            stop_signal.store(true, Ordering::SeqCst);
+            error_signal.store(true, Ordering::SeqCst);
+            return Err(e.into());
+        }
         Ok(())
     }
 }

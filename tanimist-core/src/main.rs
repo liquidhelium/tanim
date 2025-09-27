@@ -1,3 +1,9 @@
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
+use std::time::Duration;
+
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tanimist_core::video::TypstVideoRenderer;
@@ -22,8 +28,8 @@ pub struct EncoderArgs {
     #[clap(long, default_value = "nvenc_hevc")]
     pub codec: String,
     /// Constant Rate Factor (CRF) for quality control (lower is better quality, range 0-51)
-    #[clap(long, default_value = "23")]
-    pub crf: u8,
+    #[clap(long)]
+    pub crf: Option<u8>,
     #[clap(long, default_value = "medium")]
     pub preset: String,
 }
@@ -48,7 +54,9 @@ fn main() -> anyhow::Result<()> {
     let encoder_option_hashmap = {
         let mut map = std::collections::HashMap::new();
         map.insert("codec".to_string(), args.encoder.codec.clone());
-        map.insert("crf".to_string(), args.encoder.crf.to_string());
+        if let Some(crf) = args.encoder.crf {
+            map.insert("crf".to_string(), crf.to_string());
+        }
         map.insert("preset".to_string(), args.encoder.preset.clone());
         map
     };
@@ -60,10 +68,11 @@ fn main() -> anyhow::Result<()> {
         encoder_option_hashmap,
     );
 
-    let (render_tx, render_rx) = crossbeam::channel::unbounded();
-    let (encode_tx, encode_rx) = crossbeam::channel::unbounded();
-
     let total_frames = 240;
+
+    let render_progress = Arc::new(AtomicU64::new(0));
+    let encode_progress = Arc::new(AtomicU64::new(0));
+    let error_signal = Arc::new(AtomicBool::new(false));
 
     let m = MultiProgress::new();
     let sty = ProgressStyle::with_template(
@@ -80,41 +89,59 @@ fn main() -> anyhow::Result<()> {
     pb_encode.set_style(sty);
     pb_encode.set_message("encoding");
 
-    let progress_thread = std::thread::Builder::new()
-        .name("progress".to_string())
-        .spawn(move || {
-            let mut render_done = false;
-            let mut encode_done = false;
-            while !render_done || !encode_done {
-                crossbeam::channel::select! {
-                    recv(render_rx) -> _ => {
-                        pb_render.inc(1);
-                        if pb_render.position() == total_frames {
-                            render_done = true;
-                            pb_render.finish_with_message("rendered");
-                        }
-                    },
-                    recv(encode_rx) -> _ => {
-                        pb_encode.inc(1);
-                        if pb_encode.position() == total_frames {
-                            encode_done = true;
-                            pb_encode.finish_with_message("encoded");
-                        }
+    let progress_thread = {
+        let render_progress = render_progress.clone();
+        let encode_progress = encode_progress.clone();
+        let error_signal = error_signal.clone();
+        std::thread::Builder::new()
+            .name("progress".to_string())
+            .spawn(move || {
+                while pb_render.position() < total_frames || pb_encode.position() < total_frames {
+                    if error_signal.load(Ordering::SeqCst) {
+                        pb_render.abandon_with_message("rendering failed");
+                        pb_encode.abandon_with_message("encoding failed");
+                        break;
                     }
+
+                    let render_pos = render_progress.load(Ordering::SeqCst);
+                    pb_render.set_position(render_pos);
+                    if render_pos == total_frames {
+                        pb_render.finish_with_message("rendered");
+                    }
+
+                    let encode_pos = encode_progress.load(Ordering::SeqCst);
+                    pb_encode.set_position(encode_pos);
+                    if encode_pos == total_frames {
+                        pb_encode.finish_with_message("encoded");
+                    }
+
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-            }
-        })
-        .unwrap();
+            })
+            .unwrap()
+    };
 
     let render_thread = std::thread::Builder::new()
         .name("render".to_string())
         .spawn(move || {
-            renderer.render(0, total_frames as i32, 24, Some(render_tx), Some(encode_tx))
+            renderer.render(
+                0,
+                total_frames as i32,
+                24,
+                Some(render_progress),
+                Some(encode_progress),
+                error_signal,
+            )
         })
         .unwrap();
 
-    let data = render_thread.join().unwrap()?;
-    m.clear()?;
+    let data = match render_thread.join().unwrap() {
+        Ok(data) => data,
+        Err(e) => {
+            m.clear()?;
+            return Err(e.into());
+        }
+    };
     progress_thread.join().unwrap();
     std::fs::write(&args.output, data)?;
     info!("Finished in {:?}", start.elapsed());
