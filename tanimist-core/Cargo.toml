@@ -1,0 +1,21 @@
+[package]
+name = "tanimist-core"
+version = "0.13.1"
+edition = "2024"
+
+[dependencies]
+typst = {workspace = true}
+typst-render = {workspace = true}
+tinymist-world = {workspace = true}
+video-rs = {workspace = true}
+crossbeam = "0.8.4"
+tiny-skia = "0.11.4"
+tracing = "0.1.41"
+thiserror = "2.0.16"
+ndarray = "0.16.1"
+num_cpus = "1.17.0"
+tempfile = "3.10.1"
+clap = "4.5.48"
+anyhow = "1.0.100"
+tokio = { version = "1.47.1", features = ["full"] }
+indicatif = "0.18.0"
