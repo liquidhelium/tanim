@@ -1,9 +1,9 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64},
+    atomic::AtomicBool,
     Arc,
 };
 
-use clap::Parser;
+use clap::{builder::ValueParser, Parser};
 use tanimist_cli::video::TypstVideoRenderer;
 use tinymist_world::args::CompileOnceArgs;
 use tracing::info;
@@ -11,7 +11,7 @@ use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use typst::foundations::{Dict, Str, Value};
 
-#[derive(Debug, Clone, Parser, Default)]
+#[derive(Debug, Clone, Parser,)]
 pub struct Args {
     #[clap(flatten)]
     pub compile_once: CompileOnceArgs,
@@ -19,8 +19,27 @@ pub struct Args {
     pub variable: String,
     #[clap(long, short, default_value = "out.mp4")]
     pub output: String,
+    #[clap(long, short, default_value = "0..=240", value_parser = ValueParser::new(parse_range))]
+    pub frames: std::ops::RangeInclusive<i32>,
     #[clap(flatten)]
     pub encoder: EncoderArgs,
+}
+
+fn parse_range(s: &str) -> Result<std::ops::RangeInclusive<i32>, String> {
+    let parts: Vec<&str> = s.split("..=").collect();
+    if parts.len() != 2 {
+        return Err("Range must be in the format start..=end".to_string());
+    }
+    let start: i32 = parts[0]
+        .parse()
+        .map_err(|_| "Invalid start of range".to_string())?;
+    let end: i32 = parts[1]
+        .parse()
+        .map_err(|_| "Invalid end of range".to_string())?;
+    if start > end {
+        return Err("Start of range must be less than or equal to end".to_string());
+    }
+    Ok(start..=end)
 }
 
 #[derive(Debug, Clone, Parser, Default)]
@@ -42,7 +61,7 @@ fn main() -> anyhow::Result<()> {
         .with(indicatif_layer)
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "tanimist_core=info,video_rs=warn,ffmpeg=error".into()),
+                .unwrap_or_else(|_| "tanimist_cli=info,video_rs=warn,ffmpeg=error".into()),
         )
         .init();
     let args = Args::parse();
@@ -70,21 +89,15 @@ fn main() -> anyhow::Result<()> {
         encoder_option_hashmap,
     );
 
-    let total_frames = 240;
-
-    let render_progress = Arc::new(AtomicU64::new(0));
-    let encode_progress = Arc::new(AtomicU64::new(0));
     let error_signal = Arc::new(AtomicBool::new(false));
 
     let render_thread = std::thread::Builder::new()
         .name("render".to_string())
         .spawn(move || {
             renderer.render(
-                0,
-                total_frames as i32,
+                *args.frames.start(),
+                *args.frames.end(),
                 24,
-                Some(render_progress),
-                Some(encode_progress),
                 error_signal,
             )
         })

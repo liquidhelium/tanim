@@ -1,20 +1,20 @@
 use crossbeam::channel;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressStyle;
 use ndarray::Array3;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Once,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
 };
 use thiserror::Error;
 use tiny_skia::Pixmap;
 use tinymist_world::{TaskInputs, TypstSystemUniverse};
-use tracing::{debug_span, info, info_span, instrument, Span};
+use tracing::{Span, debug_span, info, info_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use typst::{diag::SourceDiagnostic, foundations::Dict, layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
@@ -135,8 +135,6 @@ impl TypstVideoRenderer {
         begin_t: i32,
         end_t: i32,
         fps: i32,
-        _render_progress: Option<Arc<AtomicU64>>,
-        _encode_progress: Option<Arc<AtomicU64>>,
         error_signal: Arc<AtomicBool>,
     ) -> Result<Vec<u8>, Error> {
         let root_span = debug_span!("render");
@@ -182,7 +180,7 @@ impl TypstVideoRenderer {
         let output_path = file.path().to_owned();
         let self_arc = std::sync::Arc::new(self);
         let num_workers = (num_cpus::get() - 2).max(1);
-        let _re =rendering_span.enter();
+        let _re = rendering_span.enter();
         let workers: Vec<_> = (0..num_workers)
             .map(|i| {
                 let task_rx = task_rx.clone();
@@ -254,8 +252,6 @@ impl TypstVideoRenderer {
                 .unwrap()
         };
 
-        
-
         for t in begin_t..end_t {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
@@ -303,6 +299,7 @@ impl TypstVideoRenderer {
     }
 
     #[instrument(level = "debug", skip_all, fields(output_path = %output_path))]
+    #[allow(clippy::too_many_arguments)]
     fn encode_video(
         rx: channel::Receiver<(i32, Array3<u8>)>,
         width: u32,
@@ -345,10 +342,10 @@ impl TypstVideoRenderer {
                     error_signal.store(true, Ordering::SeqCst);
                     return Err(e.into());
                 }
-                if !stop_signal.load(Ordering::SeqCst) {
-                    if let Some(p) = &encode_progress {
-                        p.pb_inc(1);
-                    }
+                if !stop_signal.load(Ordering::SeqCst)
+                    && let Some(p) = &encode_progress
+                {
+                    p.pb_inc(1);
                 }
                 drop(_encode_span);
                 next_expected += 1;
