@@ -175,8 +175,8 @@ impl TypstVideoRenderer {
         }
 
         let num_workers = (num_cpus::get() - 2).max(1);
-        let (frame_tx, frame_rx) = channel::bounded::<(i32, Vec<u8>)>(num_workers);
-        let (task_tx, task_rx) = channel::bounded::<i32>(num_workers);
+        let (frame_tx, frame_rx) = channel::bounded::<(i32, Vec<u8>)>(num_workers*2);
+        let (task_tx, task_rx) = channel::bounded::<i32>(num_workers*2);
 
         let mut file = tempfile::Builder::new().suffix(".mp4").tempfile()?;
         let output_path = file.path().to_owned();

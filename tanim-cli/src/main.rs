@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use clap::{builder::ValueParser, Parser};
-use tanimist_cli::video::TypstVideoRenderer;
+use tanim_cli::video::TypstVideoRenderer;
 use tinymist_world::args::CompileOnceArgs;
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
@@ -63,7 +63,7 @@ fn main() -> anyhow::Result<()> {
         .with(indicatif_layer)
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "tanimist_cli=info,video=warn,ffmpeg=error".into()),
+                .unwrap_or_else(|_| "tanim_cli=info,video=warn,ffmpeg=error".into()),
         )
         .init();
     let args = Args::parse();

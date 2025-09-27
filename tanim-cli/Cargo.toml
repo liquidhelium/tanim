@@ -1,5 +1,5 @@
 [package]
-name = "tanimist-cli"
+name = "tanim-cli"
 version = "0.13.1"
 edition = "2024"
 

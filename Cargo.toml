@@ -1,9 +1,9 @@
 [workspace]
-members = ["tanimist-core"]
+members = ["tanim-cli"]
 resolver = "3"
 
 [workspace.dependencies]
 typst = "0.13.1"
 typst-render = "0.13.1"
-tinymist-world = {version = "0.13", features = ["system"]}
+tinymist-world = {version = "0.13", features = ["system", "fonts"]}
 video-rs = {version = "0.10.4", features = ["ndarray"]}
