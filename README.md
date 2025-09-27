@@ -53,11 +53,15 @@ Here are a couple of examples of what you can create with Tanim CLI:
 
 ### Manim-style Text Animation
 
-![Manim-style Text Animation](assets/manim.mp4)
+
+https://github.com/user-attachments/assets/8669607a-e385-4fcf-a33b-53627a5d3512
+
 
 ### Physics Simulation
 
-![Physics Simulation](assets/physics.mp4)
+
+https://github.com/user-attachments/assets/ee742e51-c172-4eac-90c6-1d2aa02ac85e
+
 
 ## Command-line Arguments
 
