@@ -151,10 +151,12 @@ impl TypstVideoRenderer {
         let output_path = file.path().to_owned();
         let encode_thread = {
             let ffmpeg_options = self.ffmpeg_options.clone();
-            thread::spawn(move || {
-                Self::encode_video(
-                    frame_rx,
-                    width,
+            thread::Builder::new()
+                .name("encoder".to_string())
+                .spawn(move || {
+                    Self::encode_video(
+                        frame_rx,
+                        width,
                     height,
                     fps,
                     &output_path.to_string_lossy(),
@@ -163,21 +165,24 @@ impl TypstVideoRenderer {
                     ffmpeg_options,
                 )
             })
+            .unwrap()
         };
 
         let self_arc = std::sync::Arc::new(self);
         let num_workers = (num_cpus::get() - 2).max(1);
         let workers: Vec<_> = (0..num_workers)
-            .map(|_| {
+            .map(|i| {
                 let task_rx = task_rx.clone();
                 let frame_tx = frame_tx.clone();
                 let self_clone = self_arc.clone();
 
                 let render_progress = render_progress.clone();
-                thread::spawn(move || {
-                    while let Ok(t) = task_rx.recv() {
-                        let _span = tracing::info_span!("worker_frame", t = t).entered();
-                        match self_clone.render_frame(t) {
+                thread::Builder::new()
+                    .name(format!("worker-{}", i))
+                    .spawn(move || {
+                        while let Ok(t) = task_rx.recv() {
+                            let _span = tracing::info_span!("worker_frame", t = t).entered();
+                            match self_clone.render_frame(t) {
                             Ok(pixmap) => {
                                 match Self::process_frame(pixmap) {
                                     Ok(frame) => {
@@ -200,6 +205,7 @@ impl TypstVideoRenderer {
                         }
                     }
                 })
+                .unwrap()
             })
             .collect();
 

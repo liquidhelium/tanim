@@ -29,6 +29,7 @@ pub struct EncoderArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
     tracing_subscriber::fmt::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_env_filter("tanimist_core=info,video_rs=warn,ffmpeg=error")
@@ -79,37 +80,44 @@ fn main() -> anyhow::Result<()> {
     pb_encode.set_style(sty);
     pb_encode.set_message("encoding");
 
-    let progress_thread = std::thread::spawn(move || {
-        let mut render_done = false;
-        let mut encode_done = false;
-        while !render_done || !encode_done {
-            crossbeam::channel::select! {
-                recv(render_rx) -> _ => {
-                    pb_render.inc(1);
-                    if pb_render.position() == total_frames {
-                        render_done = true;
-                        pb_render.finish_with_message("rendered");
-                    }
-                },
-                recv(encode_rx) -> _ => {
-                    pb_encode.inc(1);
-                    if pb_encode.position() == total_frames {
-                        encode_done = true;
-                        pb_encode.finish_with_message("encoded");
+    let progress_thread = std::thread::Builder::new()
+        .name("progress".to_string())
+        .spawn(move || {
+            let mut render_done = false;
+            let mut encode_done = false;
+            while !render_done || !encode_done {
+                crossbeam::channel::select! {
+                    recv(render_rx) -> _ => {
+                        pb_render.inc(1);
+                        if pb_render.position() == total_frames {
+                            render_done = true;
+                            pb_render.finish_with_message("rendered");
+                        }
+                    },
+                    recv(encode_rx) -> _ => {
+                        pb_encode.inc(1);
+                        if pb_encode.position() == total_frames {
+                            encode_done = true;
+                            pb_encode.finish_with_message("encoded");
+                        }
                     }
                 }
             }
-        }
-    });
+        })
+        .unwrap();
 
-    let render_thread = std::thread::spawn(move || {
-        renderer.render(0, total_frames as i32, 24, Some(render_tx), Some(encode_tx))
-    });
+    let render_thread = std::thread::Builder::new()
+        .name("render".to_string())
+        .spawn(move || {
+            renderer.render(0, total_frames as i32, 24, Some(render_tx), Some(encode_tx))
+        })
+        .unwrap();
 
     let data = render_thread.join().unwrap()?;
     m.clear()?;
     progress_thread.join().unwrap();
     std::fs::write(&args.output, data)?;
+    info!("Finished in {:?}", start.elapsed());
     info!("Wrote output to {}", args.output);
     Ok(())
 }
