@@ -33,7 +33,7 @@ Where `<input>` is your Typst file.
 1.  Create a Typst file named `animation.typ`:
 
     ```typst
-    #let t = 0
+    #let t = sys.inputs.at("t", default: 300)
     
     #rect(width: 100%, height: 100%, fill: rgb("f0f0f0"))
     #text(16pt, "Frame: " + str(t))
