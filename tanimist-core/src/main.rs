@@ -21,6 +21,8 @@ pub struct Args {
     pub output: String,
     #[clap(long, short, default_value = "0..=240", value_parser = ValueParser::new(parse_range))]
     pub frames: std::ops::RangeInclusive<i32>,
+    #[clap(long, default_value = "150.0")]
+    pub ppi: f32,
     #[clap(flatten)]
     pub encoder: EncoderArgs,
 }
@@ -61,7 +63,7 @@ fn main() -> anyhow::Result<()> {
         .with(indicatif_layer)
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "tanimist_cli=info,video_rs=warn,ffmpeg=error".into()),
+                .unwrap_or_else(|_| "tanimist_cli=info,video=warn,ffmpeg=error".into()),
         )
         .init();
     let args = Args::parse();
@@ -83,7 +85,7 @@ fn main() -> anyhow::Result<()> {
     };
     
     let renderer = TypstVideoRenderer::new(
-        300.0,
+        args.ppi,
         move |t| Dict::from_iter([(Str::from(args.variable.clone()), Value::Int(t.into()))]),
         univ,
         encoder_option_hashmap,
