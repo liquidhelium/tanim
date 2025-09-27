@@ -4,19 +4,14 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Once},
     thread,
 };
 use thiserror::Error;
 use tiny_skia::Pixmap;
-use tinymist_world::{
-    args::CompileOnceArgs, package::RegistryPathMapper, system::SystemUniverseBuilder, vfs::{system::SystemAccessModel, Vfs}, EntryState, TaskInputs, TypstSystemUniverse
-};
+use tinymist_world::{TaskInputs, TypstSystemUniverse};
 use tracing::instrument;
-use typst::{
-    Features, diag::SourceDiagnostic, foundations::Dict, layout::PagedDocument,
-    syntax::VirtualPath, utils::LazyHash,
-};
+use typst::{diag::SourceDiagnostic, foundations::Dict, layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
 use video_rs::{Encoder, Location, Time};
 
@@ -60,7 +55,11 @@ pub struct TypstVideoRenderer {
 
 impl TypstVideoRenderer {
     #[instrument(skip_all)]
-    pub fn new(ppi: f32, f_input: impl Fn(i32) -> Dict + 'static + Send + Sync, universe: TypstSystemUniverse) -> Self {
+    pub fn new(
+        ppi: f32,
+        f_input: impl Fn(i32) -> Dict + 'static + Send + Sync,
+        universe: TypstSystemUniverse,
+    ) -> Self {
         Self {
             universe,
             ppi,
@@ -125,8 +124,16 @@ impl TypstVideoRenderer {
         begin_t: i32,
         end_t: i32,
         fps: i32,
-        progress: Option<channel::Sender<i32>>,
+        render_progress: Option<channel::Sender<()>>,
+        encode_progress: Option<channel::Sender<()>>,
     ) -> Result<Vec<u8>, Error> {
+        static FFMPEG_INIT: Once = Once::new();
+        FFMPEG_INIT.call_once(|| {
+            if video_rs::init().is_ok() {
+                video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Quiet);
+            }
+        });
+
         let sample_frame = self.render_frame(begin_t)?;
         let width = sample_frame.width() / 2 * 2;
         let height = sample_frame.height() / 2 * 2;
@@ -135,7 +142,6 @@ impl TypstVideoRenderer {
             return Err(Error::NoPages);
         }
 
-        let total_frames = end_t - begin_t;
         let (frame_tx, frame_rx) = channel::bounded::<(i32, Array3<u8>)>(64);
         let (task_tx, task_rx) = channel::unbounded::<i32>();
 
@@ -150,7 +156,7 @@ impl TypstVideoRenderer {
                     fps,
                     &output_path.to_string_lossy(),
                     begin_t,
-                    total_frames,
+                    encode_progress,
                 )
             })
         };
@@ -163,22 +169,22 @@ impl TypstVideoRenderer {
                 let frame_tx = frame_tx.clone();
                 let self_clone = self_arc.clone();
 
-                let progress = progress.clone();
+                let render_progress = render_progress.clone();
                 thread::spawn(move || {
                     while let Ok(t) = task_rx.recv() {
                         let _span = tracing::info_span!("worker_frame", t = t).entered();
                         match self_clone.render_frame(t) {
                             Ok(pixmap) => {
-                                if let Some(progress) = &progress {
-                                    if progress.send(t).is_err() {
-                                        // Progress receiver has been dropped, stop sending.
-                                    }
-                                }
                                 match Self::process_frame(pixmap) {
                                     Ok(frame) => {
                                         if frame_tx.send((t, frame)).is_err() {
                                             // Encoder thread has likely panicked, stop sending.
                                             break;
+                                        }
+                                        if let Some(p) = &render_progress
+                                            && p.send(()).is_err()
+                                        {
+                                            // Progress receiver has been dropped, stop sending.
                                         }
                                     }
                                     Err(e) => panic!("Error processing frame {t}: {e}"),
@@ -239,7 +245,7 @@ impl TypstVideoRenderer {
         fps: i32,
         output_path: &str,
         begin_t: i32,
-        _total_frames: i32,
+        encode_progress: Option<channel::Sender<()>>,
     ) -> Result<(), Error> {
         let mut options = HashMap::new();
         options.insert("preset".to_string(), "faster".to_string());
@@ -263,6 +269,11 @@ impl TypstVideoRenderer {
                 let _encode_span =
                     tracing::info_span!("encode_frame", frame_num = next_expected).entered();
                 encoder.encode(&frame, timestamp)?;
+                if let Some(p) = &encode_progress
+                    && p.send(()).is_err()
+                {
+                    // Progress receiver has been dropped, stop sending.
+                }
                 drop(_encode_span);
                 next_expected += 1;
             }
@@ -274,6 +285,11 @@ impl TypstVideoRenderer {
             let _encode_span =
                 tracing::info_span!("encode_remaining_frame", frame_num = next_expected).entered();
             encoder.encode(&frame, timestamp)?;
+            if let Some(p) = &encode_progress
+                && p.send(()).is_err()
+            {
+                // Progress receiver has been dropped, stop sending.
+            }
             drop(_encode_span);
             next_expected += 1;
         }
