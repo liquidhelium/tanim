@@ -201,7 +201,7 @@ impl TypstVideoRenderer {
                                 Ok(pixmap) => match Self::process_frame(pixmap) {
                                     Ok(frame) => {
                                         if frame_tx
-                                            .send((t, frame.into_raw_vec()))
+                                            .send((t, frame.into_raw_vec_and_offset().0))
                                             .is_err()
                                         {
                                             // Encoder thread has likely panicked, stop sending.
