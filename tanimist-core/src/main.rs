@@ -2,6 +2,7 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tanimist_core::video::TypstVideoRenderer;
 use tinymist_world::args::CompileOnceArgs;
+use tracing::info;
 use typst::foundations::{Dict, Str, Value};
 
 #[derive(Debug, Clone, Parser, Default)]
@@ -12,10 +13,29 @@ pub struct Args {
     pub variable: String,
     #[clap(long, short, default_value = "out.mp4")]
     pub output: String,
+    #[clap(flatten)]
+    pub encoder: EncoderArgs,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+#[derive(Debug, Clone, Parser, Default)]
+pub struct EncoderArgs {
+    #[clap(long, default_value = "nvenc_hevc")]
+    pub codec: String,
+    /// Constant Rate Factor (CRF) for quality control (lower is better quality, range 0-51)
+    #[clap(long, default_value = "23")]
+    pub crf: u8,
+    #[clap(long, default_value = "medium")]
+    pub preset: String,
+}
+
+fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_env_filter("tanimist_core=info,video_rs=warn,ffmpeg=error")
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .compact()
+        .init();
     let args = Args::parse();
     let univ = match args.compile_once.resolve_system() {
         Ok(u) => u,
@@ -24,10 +44,19 @@ async fn main() -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
+    let encoder_option_hashmap = {
+        let mut map = std::collections::HashMap::new();
+        map.insert("codec".to_string(), args.encoder.codec.clone());
+        map.insert("crf".to_string(), args.encoder.crf.to_string());
+        map.insert("preset".to_string(), args.encoder.preset.clone());
+        map
+    };
+    
     let renderer = TypstVideoRenderer::new(
         300.0,
         move |t| Dict::from_iter([(Str::from(args.variable.clone()), Value::Int(t.into()))]),
         univ,
+        encoder_option_hashmap,
     );
 
     let (render_tx, render_rx) = crossbeam::channel::unbounded();
@@ -73,14 +102,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let render_thread = tokio::task::spawn_blocking(move || {
+    let render_thread = std::thread::spawn(move || {
         renderer.render(0, total_frames as i32, 24, Some(render_tx), Some(encode_tx))
     });
 
-    let data = render_thread.await??;
+    let data = render_thread.join().unwrap()?;
     m.clear()?;
     progress_thread.join().unwrap();
     std::fs::write(&args.output, data)?;
-    println!("Wrote output to {}", args.output);
+    info!("Wrote output to {}", args.output);
     Ok(())
 }

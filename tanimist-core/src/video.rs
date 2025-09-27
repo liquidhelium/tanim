@@ -10,7 +10,7 @@ use std::{
 use thiserror::Error;
 use tiny_skia::Pixmap;
 use tinymist_world::{TaskInputs, TypstSystemUniverse};
-use tracing::instrument;
+use tracing::{info, instrument};
 use typst::{diag::SourceDiagnostic, foundations::Dict, layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
 use video_rs::{Encoder, Location, Time};
@@ -51,6 +51,7 @@ pub struct TypstVideoRenderer {
     universe: TypstSystemUniverse,
     ppi: f32,
     f_input: Box<dyn Fn(i32) -> Dict + 'static + Send + Sync>,
+    ffmpeg_options: HashMap<String, String>,
 }
 
 impl TypstVideoRenderer {
@@ -59,11 +60,13 @@ impl TypstVideoRenderer {
         ppi: f32,
         f_input: impl Fn(i32) -> Dict + 'static + Send + Sync,
         universe: TypstSystemUniverse,
+        ffmpeg_options: HashMap<String, String>,
     ) -> Self {
         Self {
             universe,
             ppi,
             f_input: Box::new(f_input),
+            ffmpeg_options,
         }
     }
 
@@ -129,9 +132,8 @@ impl TypstVideoRenderer {
     ) -> Result<Vec<u8>, Error> {
         static FFMPEG_INIT: Once = Once::new();
         FFMPEG_INIT.call_once(|| {
-            if video_rs::init().is_ok() {
-                video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Quiet);
-            }
+            video_rs::init().unwrap();
+            video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Error);
         });
 
         let sample_frame = self.render_frame(begin_t)?;
@@ -148,6 +150,7 @@ impl TypstVideoRenderer {
         let mut file = tempfile::Builder::new().suffix(".mp4").tempfile()?;
         let output_path = file.path().to_owned();
         let encode_thread = {
+            let ffmpeg_options = self.ffmpeg_options.clone();
             thread::spawn(move || {
                 Self::encode_video(
                     frame_rx,
@@ -157,6 +160,7 @@ impl TypstVideoRenderer {
                     &output_path.to_string_lossy(),
                     begin_t,
                     encode_progress,
+                    ffmpeg_options,
                 )
             })
         };
@@ -237,7 +241,7 @@ impl TypstVideoRenderer {
         .map_err(Error::Io)
     }
 
-    #[instrument]
+    #[instrument(skip_all, fields(output_path = %output_path))]
     fn encode_video(
         rx: channel::Receiver<(i32, Array3<u8>)>,
         width: u32,
@@ -246,15 +250,14 @@ impl TypstVideoRenderer {
         output_path: &str,
         begin_t: i32,
         encode_progress: Option<channel::Sender<()>>,
+        ffmpeg_options: HashMap<String, String>,
     ) -> Result<(), Error> {
-        let mut options = HashMap::new();
-        options.insert("preset".to_string(), "faster".to_string());
-        let options = options.into();
+        info!("using ffmpeg options: {ffmpeg_options:?}");
         let settings = video_rs::encode::Settings::preset_h264_custom(
             width as usize,
             height as usize,
             video_rs::ffmpeg::format::Pixel::YUV420P,
-            options,
+            ffmpeg_options.into(),
         );
         let mut encoder = Encoder::new(Location::File(PathBuf::from(output_path)), settings)?;
 
