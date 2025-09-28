@@ -5,14 +5,14 @@ use std::path::Path;
 use video_rs::{MuxerBuilder, Reader, Writer};
 
 #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
-pub fn merge_mp4_files(input_files: Vec<&str>, output_file: &str) -> Result<String> {
+pub fn merge_mp4_files(input_files: &Vec<&str>, output_file: &str) -> Result<String> {
     // 创建输出写入器
     let writer = Writer::new(Path::new(output_file))?;
     let mut muxer_builder = MuxerBuilder::new(writer);
 
     // 创建读取器并添加流
     let mut readers = Vec::new();
-    for input_file in &input_files {
+    for input_file in input_files {
         let reader = Reader::new(Path::new(input_file))?;
         muxer_builder = muxer_builder.with_streams(&reader)?;
         readers.push(reader);

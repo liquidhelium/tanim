@@ -26,6 +26,109 @@ use super::{
     error::{Error, Result},
     merger::merge_mp4_files,
 };
+
+struct FrameEncoder {
+    encoder: Encoder,
+    received_frames: BTreeMap<i32, Vec<u8>>,
+    next_expected: i32,
+    width: u32,
+    height: u32,
+    fps: i32,
+    video_begin_t: i32,
+}
+
+impl FrameEncoder {
+    fn new(
+        output_path: &str,
+        width: u32,
+        height: u32,
+        fps: i32,
+        begin_t: i32,
+        video_begin_t: i32,
+        ffmpeg_options: HashMap<String, String>,
+    ) -> Result<Self> {
+        info!("using ffmpeg options: {ffmpeg_options:?}");
+        let settings = video_rs::encode::Settings::preset_h264_custom(
+            width as usize,
+            height as usize,
+            video_rs::ffmpeg::format::Pixel::YUV420P,
+            ffmpeg_options.into(),
+        );
+        let encoder = Encoder::new(Location::File(PathBuf::from(output_path)), settings)?;
+        Ok(Self {
+            encoder,
+            received_frames: BTreeMap::new(),
+            next_expected: begin_t,
+            width,
+            height,
+            fps,
+            video_begin_t,
+        })
+    }
+
+    fn encode_frame(
+        &mut self,
+        frame_num: i32,
+        frame: Vec<u8>,
+        encode_progress: Option<&Span>,
+        stop_signal: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::debug_span!("encoder_recv", frame_num = frame_num).entered();
+        self.received_frames.insert(frame_num, frame);
+        while let Some(raw_frame) = self.received_frames.remove(&self.next_expected) {
+            if stop_signal.load(Ordering::SeqCst) {
+                break;
+            }
+            let frame = Array3::from_shape_vec(
+                (self.height as usize, self.width as usize, 3),
+                raw_frame,
+            )?;
+            let timestamp =
+                Time::from_secs((self.next_expected - self.video_begin_t) as f32 / self.fps as f32);
+            #[cfg(feature = "tracy")]
+            let _encode_span =
+                tracing::debug_span!("encode_frame", frame_num = self.next_expected).entered();
+            self.encoder.encode(&frame, timestamp)?;
+            if !stop_signal.load(Ordering::SeqCst)
+                && let Some(p) = encode_progress
+            {
+                p.pb_inc(1);
+            }
+            #[cfg(feature = "tracy")]
+            drop(_encode_span);
+            self.next_expected += 1;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, encode_progress: Option<&Span>) -> Result<()> {
+        // After the channel is closed, process any remaining frames in the map.
+        while let Some(raw_frame) = self.received_frames.remove(&self.next_expected) {
+            let frame = Array3::from_shape_vec(
+                (self.height as usize, self.width as usize, 3),
+                raw_frame,
+            )?;
+            let timestamp =
+                Time::from_secs((self.next_expected - self.video_begin_t) as f32 / self.fps as f32);
+            #[cfg(feature = "tracy")]
+            let _encode_span =
+                tracing::debug_span!("encode_remaining_frame", frame_num = self.next_expected)
+                    .entered();
+            self.encoder.encode(&frame, timestamp)?;
+            if let Some(p) = encode_progress {
+                p.pb_inc(1);
+            }
+            #[cfg(feature = "tracy")]
+            drop(_encode_span);
+            self.next_expected += 1;
+        }
+
+        self.encoder.finish()?;
+        Ok(())
+    }
+}
+
 pub struct TypstVideoRenderer {
     config: RenderConfig,
 }
@@ -87,18 +190,34 @@ impl TypstVideoRenderer {
         )?)
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip(self)))]
     pub fn render(self, error_signal: Arc<AtomicBool>) -> Result<Vec<u8>> {
+        let (width, height, rendering_span, encoding_span, stop_signal) = self.prepare_render()?;
+        let self_arc = Arc::new(self);
+
+        let results = self_arc.spawn_render_workers(
+            width,
+            height,
+            rendering_span,
+            encoding_span,
+            stop_signal.clone(),
+            error_signal.clone(),
+        );
+
+        let output_files = self_arc.wait_for_workers(results)?;
+
+        if stop_signal.load(Ordering::SeqCst) {
+            return Err(Error::RenderOrEncode);
+        }
+
+        self_arc.merge_video_chunks(output_files)
+    }
+
+    fn prepare_render(&self) -> Result<(u32, u32, Span, Span, Arc<AtomicBool>)> {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
-        let fps = self.config.fps;
 
-        #[cfg(feature = "tracy")]
-        let root_span = debug_span!("render");
         let rendering_span = info_span!("rendering");
         let encoding_span = info_span!("encoding");
-        #[cfg(feature = "tracy")]
-        let _enter = root_span.enter();
 
         let sty = ProgressStyle::with_template(
             "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
@@ -131,15 +250,32 @@ impl TypstVideoRenderer {
             return Err(Error::NoPages);
         }
 
-        let num_encode_workers = (num_cpus::get() / 4).max(1);
+        Ok((width, height, rendering_span, encoding_span, stop_signal))
+    }
 
-        let self_arc = std::sync::Arc::new(self);
+    fn spawn_render_workers(
+        self: &Arc<Self>,
+        width: u32,
+        height: u32,
+        rendering_span: Span,
+        encoding_span: Span,
+        stop_signal: Arc<AtomicBool>,
+        error_signal: Arc<AtomicBool>,
+    ) -> Vec<(
+        thread::JoinHandle<Result<()>>,
+        tempfile::NamedTempFile,
+        thread::JoinHandle<()>,
+    )> {
+        let begin_t = self.config.begin_t;
+        let end_t = self.config.end_t;
+        let fps = self.config.fps;
+        let num_encode_workers = (num_cpus::get() / 4).max(1);
+        let frames_per_worker = (end_t - begin_t) / num_encode_workers as i32;
+
         let _re = rendering_span.enter();
         let _en = encoding_span.enter();
 
-        let frames_per_worker = (end_t - begin_t) / num_encode_workers as i32;
-
-        let results: Vec<_> = (0..num_encode_workers)
+        (0..num_encode_workers)
             .map(|i| {
                 let chunk_begin_t = begin_t + i as i32 * frames_per_worker;
                 let chunk_end_t = if i == num_encode_workers - 1 {
@@ -159,7 +295,7 @@ impl TypstVideoRenderer {
 
                 let output_path = file.path().to_owned();
 
-                let ffmpeg_options = self_arc.config.ffmpeg_options.clone();
+                let ffmpeg_options = self.config.ffmpeg_options.clone();
                 let stop_signal1 = stop_signal.clone();
                 let error_signal1 = error_signal.clone();
                 let encoding_span = encoding_span.clone();
@@ -184,47 +320,93 @@ impl TypstVideoRenderer {
                     })
                     .unwrap();
 
-                for t in chunk_begin_t..chunk_end_t {
-                    if stop_signal.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match self_arc.render_frame(t) {
-                        Ok(pixmap) => match Self::process_frame(pixmap) {
-                            Ok(frame) => {
-                                if frame_tx
-                                    .send((t, frame.into_raw_vec_and_offset().0))
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                if !stop_signal.load(Ordering::SeqCst) {
-                                    rendering_span.pb_inc(1);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Error processing frame {t}: {e}");
-                                stop_signal.store(true, Ordering::SeqCst);
-                                error_signal.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                        },
-                        Err(e) => {
-                            tracing::error!("Error rendering frame {t}: {e}");
-                            stop_signal.store(true, Ordering::SeqCst);
-                            error_signal.store(true, Ordering::SeqCst);
+                let self_clone = self.clone();
+                let rendering_span_clone = rendering_span.clone();
+                let stop_signal_clone = stop_signal.clone();
+                let error_signal_clone = error_signal.clone();
+
+                let render_thread = thread::Builder::new()
+                    .name(format!("renderer-{i}"))
+                    .spawn(move || {
+                        self_clone.render_chunk(
+                            chunk_begin_t,
+                            chunk_end_t,
+                            frame_tx,
+                            rendering_span_clone,
+                            stop_signal_clone,
+                            error_signal_clone,
+                        );
+                    })
+                    .unwrap();
+
+                (encode_thread, file, render_thread)
+            })
+            .collect()
+    }
+
+    fn render_chunk(
+        &self,
+        chunk_begin_t: i32,
+        chunk_end_t: i32,
+        frame_tx: channel::Sender<(i32, Vec<u8>)>,
+        rendering_span: Span,
+        stop_signal: Arc<AtomicBool>,
+        error_signal: Arc<AtomicBool>,
+    ) {
+        for t in chunk_begin_t..chunk_end_t {
+            if stop_signal.load(Ordering::SeqCst) {
+                break;
+            }
+            match self.render_frame(t) {
+                Ok(pixmap) => match Self::process_frame(pixmap) {
+                    Ok(frame) => {
+                        if frame_tx
+                            .send((t, frame.into_raw_vec_and_offset().0))
+                            .is_err()
+                        {
                             break;
                         }
+                        if !stop_signal.load(Ordering::SeqCst) {
+                            rendering_span.pb_inc(1);
+                        }
                     }
+                    Err(e) => {
+                        tracing::error!("Error processing frame {t}: {e}");
+                        stop_signal.store(true, Ordering::SeqCst);
+                        error_signal.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("Error rendering frame {t}: {e}");
+                    stop_signal.store(true, Ordering::SeqCst);
+                    error_signal.store(true, Ordering::SeqCst);
+                    break;
                 }
-                drop(frame_tx);
-                (encode_thread, file)
-            })
-            .collect();
+            }
+        }
+    }
 
+    fn wait_for_workers(
+        &self,
+        results: Vec<(
+            thread::JoinHandle<Result<()>>,
+            tempfile::NamedTempFile,
+            thread::JoinHandle<()>,
+        )>,
+    ) -> Result<Vec<tempfile::NamedTempFile>> {
         let mut output_files = Vec::new();
-        for (thread, file) in results {
+        for (encode_thread, file, render_thread) in results {
             output_files.push(file);
-            let encode_result = thread.join().map_err(|e| {
+            render_thread.join().map_err(|e| {
+                Error::ThreadPanic(
+                    e.downcast_ref::<&'static str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| e.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "Unknown panic in renderer thread".to_string()),
+                )
+            })?;
+            let encode_result = encode_thread.join().map_err(|e| {
                 Error::ThreadPanic(
                     e.downcast_ref::<&'static str>()
                         .map(|s| s.to_string())
@@ -234,11 +416,10 @@ impl TypstVideoRenderer {
             })?;
             encode_result?;
         }
+        Ok(output_files)
+    }
 
-        if stop_signal.load(Ordering::SeqCst) {
-            return Err(Error::RenderOrEncode);
-        }
-
+    fn merge_video_chunks(&self, output_files: Vec<tempfile::NamedTempFile>) -> Result<Vec<u8>> {
         let mut output_file = tempfile::Builder::new().suffix(".mp4").tempfile()?;
         let final_output_path = output_file.path().to_string_lossy().to_string();
         let input_paths_str: Vec<&str> = output_files
@@ -246,7 +427,7 @@ impl TypstVideoRenderer {
             .map(|p| p.path().to_str().unwrap())
             .collect();
 
-        merge_mp4_files(input_paths_str, &final_output_path)
+        merge_mp4_files(&input_paths_str, &final_output_path)
             .map_err(|e| Error::MergeVideoChunks(e.to_string()))?;
 
         let mut buf = Vec::new();
@@ -269,82 +450,40 @@ impl TypstVideoRenderer {
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
     ) -> Result<()> {
-        info!("using ffmpeg options: {ffmpeg_options:?}");
-        let settings = video_rs::encode::Settings::preset_h264_custom(
-            width as usize,
-            height as usize,
-            video_rs::ffmpeg::format::Pixel::YUV420P,
-            ffmpeg_options.into(),
-        );
-        let mut encoder = Encoder::new(Location::File(PathBuf::from(output_path)), settings)?;
-
-        let mut received_frames: BTreeMap<i32, Vec<u8>> = BTreeMap::new();
-        let mut next_expected = begin_t;
+        let mut encoder = FrameEncoder::new(
+            output_path,
+            width,
+            height,
+            fps,
+            begin_t,
+            video_begin_t,
+            ffmpeg_options,
+        )?;
 
         for (frame_num, frame) in rx {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
             }
-            #[cfg(feature = "tracy")]
-            let _span = tracing::debug_span!("encoder_recv", frame_num = frame_num).entered();
-            received_frames.insert(frame_num, frame);
-            while let Some(raw_frame) = received_frames.remove(&next_expected) {
-                if stop_signal.load(Ordering::SeqCst) {
-                    break;
-                }
-                let frame =
-                    Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
-                let timestamp =
-                    Time::from_secs((next_expected - video_begin_t) as f32 / fps as f32);
-                #[cfg(feature = "tracy")]
-                let _encode_span =
-                    tracing::debug_span!("encode_frame", frame_num = next_expected).entered();
-                if let Err(e) = encoder.encode(&frame, timestamp) {
-                    stop_signal.store(true, Ordering::SeqCst);
-                    error_signal.store(true, Ordering::SeqCst);
-                    return Err(e.into());
-                }
-                if !stop_signal.load(Ordering::SeqCst)
-                    && let Some(p) = &encode_progress
-                {
-                    p.pb_inc(1);
-                }
-                #[cfg(feature = "tracy")]
-                drop(_encode_span);
-                next_expected += 1;
+            if let Err(e) = encoder.encode_frame(
+                frame_num,
+                frame,
+                encode_progress.as_ref(),
+                &stop_signal,
+            ) {
+                stop_signal.store(true, Ordering::SeqCst);
+                error_signal.store(true, Ordering::SeqCst);
+                return Err(e);
             }
         }
 
         if !stop_signal.load(Ordering::SeqCst) {
-            // After the channel is closed, process any remaining frames in the map.
-            while let Some(raw_frame) = received_frames.remove(&next_expected) {
-                let frame =
-                    Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
-                let timestamp =
-                    Time::from_secs((next_expected - video_begin_t) as f32 / fps as f32);
-                #[cfg(feature = "tracy")]
-                let _encode_span =
-                    tracing::debug_span!("encode_remaining_frame", frame_num = next_expected)
-                        .entered();
-                if let Err(e) = encoder.encode(&frame, timestamp) {
-                    stop_signal.store(true, Ordering::SeqCst);
-                    error_signal.store(true, Ordering::SeqCst);
-                    return Err(e.into());
-                }
-                if let Some(p) = &encode_progress {
-                    p.pb_inc(1);
-                }
-                #[cfg(feature = "tracy")]
-                drop(_encode_span);
-                next_expected += 1;
+            if let Err(e) = encoder.finish(encode_progress.as_ref()) {
+                stop_signal.store(true, Ordering::SeqCst);
+                error_signal.store(true, Ordering::SeqCst);
+                return Err(e);
             }
         }
 
-        if let Err(e) = encoder.finish() {
-            stop_signal.store(true, Ordering::SeqCst);
-            error_signal.store(true, Ordering::SeqCst);
-            return Err(e.into());
-        }
         Ok(())
     }
 }
