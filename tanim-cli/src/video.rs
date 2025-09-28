@@ -178,7 +178,7 @@ impl TypstVideoRenderer {
 
         let num_render_workers = (num_cpus::get() - 2).max(1);
         let num_encode_workers = (num_cpus::get() / 4).max(1);
-        let (task_tx, task_rx) = channel::bounded::<i32>(num_render_workers * 4);
+        let (task_tx, task_rx) = channel::bounded::<i32>(num_render_workers * 10);
 
         let self_arc = std::sync::Arc::new(self);
         let _re = rendering_span.enter();
@@ -287,12 +287,32 @@ impl TypstVideoRenderer {
             })
             .collect();
 
-        for t in begin_t..end_t {
-            if stop_signal.load(Ordering::SeqCst) {
-                break;
-            }
-            if task_tx.send(t).is_err() {
-                break;
+        let num_workers = num_encode_workers as i32;
+        let frames_per_worker = (end_t - begin_t) / num_workers;
+        let chunks: Vec<_> = (0..num_workers)
+            .map(|i| {
+                let chunk_begin_t = begin_t + i * frames_per_worker;
+                let chunk_end_t = if i == num_workers - 1 {
+                    end_t
+                } else {
+                    chunk_begin_t + frames_per_worker
+                };
+                (chunk_begin_t..chunk_end_t).collect::<Vec<_>>()
+            })
+            .collect();
+
+        let max_len = chunks.iter().map(|c| c.len()).max().unwrap_or(0);
+
+        'outer: for i in 0..max_len {
+            for chunk in &chunks {
+                if let Some(&t) = chunk.get(i) {
+                    if stop_signal.load(Ordering::SeqCst) {
+                        break 'outer;
+                    }
+                    if task_tx.send(t).is_err() {
+                        break 'outer;
+                    }
+                }
             }
         }
 
