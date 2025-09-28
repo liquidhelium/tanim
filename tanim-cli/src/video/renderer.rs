@@ -1,25 +1,25 @@
 use crossbeam::channel;
 use indicatif::ProgressStyle;
 use ndarray::Array3;
-use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Once,
         atomic::{AtomicBool, Ordering},
     },
     thread,
 };
-use thiserror::Error;
 use tiny_skia::Pixmap;
-use tinymist_world::{TaskInputs, TypstSystemUniverse};
-use tracing::{Span, debug_span, info, info_span, instrument};
+use tinymist_world::TaskInputs;
+use tracing::{Span, info, info_span};
+#[cfg(feature = "tracy")]
+use tracing::{debug_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
-use typst::{diag::SourceDiagnostic, foundations::Dict, layout::PagedDocument, utils::LazyHash};
+use typst::{layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
-use video_rs::{Encoder, Location, Time, Writer};
+use video_rs::{Encoder, Location, Time};
 
 use super::{
     config::RenderConfig,
@@ -140,7 +140,6 @@ impl TypstVideoRenderer {
         let frames_per_worker = (end_t - begin_t) / num_encode_workers as i32;
 
         let results: Vec<_> = (0..num_encode_workers)
-            .into_par_iter()
             .map(|i| {
                 let chunk_begin_t = begin_t + i as i32 * frames_per_worker;
                 let chunk_end_t = if i == num_encode_workers - 1 {

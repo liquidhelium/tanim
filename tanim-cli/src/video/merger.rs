@@ -1,4 +1,5 @@
 use crate::video::error::Result;
+#[cfg(feature = "tracy")]
 use tracing::instrument;
 use std::path::Path;
 use video_rs::{MuxerBuilder, Reader, Writer};

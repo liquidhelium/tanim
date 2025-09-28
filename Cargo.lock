@@ -3202,7 +3202,6 @@ dependencies = [
  "indicatif",
  "ndarray",
  "num_cpus",
- "rayon",
  "tempfile",
  "thiserror 2.0.16",
  "tiny-skia",
