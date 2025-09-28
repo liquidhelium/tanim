@@ -4,9 +4,9 @@ use ndarray::Array3;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
-    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
-        Arc, Once,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -18,7 +18,8 @@ use tracing::{Span, debug_span, info, info_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use typst::{diag::SourceDiagnostic, foundations::Dict, layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
-use video_rs::{Encoder, Location, MuxerBuilder, Reader, Time, Writer};
+
+use std::io::Write;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -32,7 +33,7 @@ pub enum Error {
     NDArrayShape(#[from] ndarray::ShapeError),
 
     #[error("Video encoding failed: {0}")]
-    VideoEncoding(#[from] video_rs::Error),
+    VideoEncoding(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -164,11 +165,6 @@ impl TypstVideoRenderer {
         encoding_span.pb_set_message("encoding");
 
         let stop_signal = Arc::new(AtomicBool::new(false));
-        static FFMPEG_INIT: Once = Once::new();
-        FFMPEG_INIT.call_once(|| {
-            video_rs::init().unwrap();
-            video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Error);
-        });
 
         let sample_frame = self.render_frame(begin_t)?;
         let width = sample_frame.width() / 2 * 2;
@@ -209,7 +205,6 @@ impl TypstVideoRenderer {
             let stop_signal = stop_signal.clone();
             let error_signal = error_signal.clone();
             let encoding_span = encoding_span.clone();
-            let video_begin_t = begin_t;
 
             let encode_thread = thread::Builder::new()
                 .name(format!("encoder-{i}"))
@@ -221,7 +216,6 @@ impl TypstVideoRenderer {
                         fps,
                         &output_path.to_string_lossy(),
                         chunk_begin_t,
-                        video_begin_t,
                         Some(encoding_span),
                         ffmpeg_options,
                         stop_signal,
@@ -370,88 +364,107 @@ impl TypstVideoRenderer {
         fps: i32,
         output_path: &str,
         begin_t: i32,
-        video_begin_t: i32,
         encode_progress: Option<Span>,
         ffmpeg_options: HashMap<String, String>,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
     ) -> Result<(), Error> {
         info!("using ffmpeg options: {ffmpeg_options:?}");
-        let settings = video_rs::encode::Settings::preset_h264_custom(
-            width as usize,
-            height as usize,
-            video_rs::ffmpeg::format::Pixel::YUV420P,
-            ffmpeg_options.into(),
-        );
-        let mut encoder = Encoder::new(Location::File(PathBuf::from(output_path)), settings)?;
 
-        let mut received_frames: BTreeMap<i32, Vec<u8>> = BTreeMap::new();
-        let mut next_expected = begin_t;
+        let mut command = Command::new("ffmpeg");
+        command
+            .arg("-y") // Overwrite output file if it exists
+            .arg("-f")
+            .arg("rawvideo")
+            .arg("-vcodec")
+            .arg("rawvideo")
+            .arg("-s")
+            .arg(format!("{width}x{height}"))
+            .arg("-pix_fmt")
+            .arg("rgb24")
+            .arg("-r")
+            .arg(fps.to_string())
+            .arg("-i")
+            .arg("-"); // Input from stdin
 
-        for (frame_num, frame) in rx {
-            if stop_signal.load(Ordering::SeqCst) {
-                break;
-            }
-            #[cfg(feature = "tracy")]
-            let _span = tracing::debug_span!("encoder_recv", frame_num = frame_num).entered();
-            received_frames.insert(frame_num, frame);
-            while let Some(raw_frame) = received_frames.remove(&next_expected) {
-                if stop_signal.load(Ordering::SeqCst) {
-                    break;
-                }
-                let frame =
-                    Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
-                let timestamp =
-                    Time::from_secs((next_expected - video_begin_t) as f32 / fps as f32);
-                #[cfg(feature = "tracy")]
-                let _encode_span =
-                    tracing::debug_span!("encode_frame", frame_num = next_expected).entered();
-                if let Err(e) = encoder.encode(&frame, timestamp) {
-                    stop_signal.store(true, Ordering::SeqCst);
-                    error_signal.store(true, Ordering::SeqCst);
-                    return Err(e.into());
-                }
-                if !stop_signal.load(Ordering::SeqCst)
-                    && let Some(p) = &encode_progress
-                {
-                    p.pb_inc(1);
-                }
-                #[cfg(feature = "tracy")]
-                drop(_encode_span);
-                next_expected += 1;
-            }
+        for (key, value) in ffmpeg_options {
+            command.arg(format!("-{key}")).arg(value);
         }
 
-        if !stop_signal.load(Ordering::SeqCst) {
-            // After the channel is closed, process any remaining frames in the map.
-            while let Some(raw_frame) = received_frames.remove(&next_expected) {
-                let frame =
-                    Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
-                let timestamp =
-                    Time::from_secs((next_expected - video_begin_t) as f32 / fps as f32);
-                #[cfg(feature = "tracy")]
-                let _encode_span =
-                    tracing::debug_span!("encode_remaining_frame", frame_num = next_expected)
-                        .entered();
-                if let Err(e) = encoder.encode(&frame, timestamp) {
-                    stop_signal.store(true, Ordering::SeqCst);
-                    error_signal.store(true, Ordering::SeqCst);
-                    return Err(e.into());
-                }
-                if let Some(p) = &encode_progress {
-                    p.pb_inc(1);
-                }
-                #[cfg(feature = "tracy")]
-                drop(_encode_span);
-                next_expected += 1;
-            }
-        }
+        command.arg("-pix_fmt").arg("yuv420p").arg(output_path);
 
-        if let Err(e) = encoder.finish() {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(Error::Io)?;
+
+        let mut stdin = child.stdin.take().expect("Failed to open stdin");
+
+        let stop_signal1 = stop_signal.clone();
+        let encode_thread = thread::Builder::new()
+            .name("ffmpeg-stdin-writer".to_string())
+            .spawn(move || {
+                let mut received_frames: BTreeMap<i32, Vec<u8>> = BTreeMap::new();
+                let mut next_expected = begin_t;
+
+                for (frame_num, frame) in rx {
+                    if stop_signal1.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    received_frames.insert(frame_num, frame);
+                    while let Some(raw_frame) = received_frames.remove(&next_expected) {
+                        if stop_signal1.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if stdin.write_all(&raw_frame).is_err() {
+                            return;
+                        }
+                        if !stop_signal1.load(Ordering::SeqCst)
+                            && let Some(p) = &encode_progress
+                        {
+                            p.pb_inc(1);
+                        }
+                        next_expected += 1;
+                    }
+                }
+
+                if !stop_signal1.load(Ordering::SeqCst) {
+                    while let Some(raw_frame) = received_frames.remove(&next_expected) {
+                        if stdin.write_all(&raw_frame).is_err() {
+                            break;
+                        }
+                        if let Some(p) = &encode_progress {
+                            p.pb_inc(1);
+                        }
+                        next_expected += 1;
+                    }
+                }
+            })
+            .unwrap();
+
+        encode_thread.join().map_err(|e| {
+            Error::ThreadPanic(
+                e.downcast_ref::<&'static str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "Unknown panic in ffmpeg stdin writer thread".to_string()),
+            )
+        })?;
+
+        let output = child.wait_with_output().map_err(Error::Io)?;
+
+        if !output.status.success() {
             stop_signal.store(true, Ordering::SeqCst);
             error_signal.store(true, Ordering::SeqCst);
-            return Err(e.into());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!("ffmpeg failed with status {}:\n{}", output.status, stderr);
+            return Err(Error::VideoEncoding(format!(
+                "ffmpeg exited with non-zero status: {stderr}"
+            )));
         }
+
         Ok(())
     }
 }
@@ -460,39 +473,31 @@ fn merge_mp4_files(
     input_files: Vec<&str>,
     output_file: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // 创建输出写入器
-    let writer = Writer::new(Path::new(output_file))?;
-    let mut muxer_builder = MuxerBuilder::new(writer);
-
-    // 创建读取器并添加流
-    let mut readers = Vec::new();
-    for input_file in &input_files {
-        let reader = Reader::new(Path::new(input_file))?;
-        muxer_builder = muxer_builder.with_streams(&reader)?;
-        readers.push(reader);
+    let mut list_file = tempfile::Builder::new().suffix(".txt").tempfile()?;
+    for file_path in &input_files {
+        let absolute_path = std::fs::canonicalize(file_path)?;
+        writeln!(list_file, "file '{}'", absolute_path.to_string_lossy())?;
     }
 
-    // 构建 muxer
-    let mut muxer = muxer_builder.build();
+    let list_path = list_file.path().to_string_lossy();
 
-    // 处理每个文件的数据包
-    for mut reader in readers {
-        // 获取最佳视频流索引
-        let stream_index = reader
-            .input
-            .streams()
-            .find(|stream| stream.parameters().medium() == video_rs::ffmpeg::media::Type::Video)
-            .map(|stream| stream.index())
-            .unwrap_or(0);
+    let output = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&*list_path)
+        .arg("-c")
+        .arg("copy")
+        .arg(output_file)
+        .output()?;
 
-        // 读取并合并数据包
-        while let Ok(packet) = reader.read(stream_index) {
-            muxer.mux(packet)?;
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg failed to merge files: {stderr}").into());
     }
-
-    // 完成合并
-    muxer.finish()?;
 
     Ok(output_file.to_string())
 }

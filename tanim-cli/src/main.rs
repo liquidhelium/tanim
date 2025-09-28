@@ -79,7 +79,7 @@ fn main() -> anyhow::Result<()> {
     };
     let encoder_option_hashmap = {
         let mut map = std::collections::HashMap::new();
-        map.insert("codec".to_string(), args.encoder.codec.clone());
+        map.insert("vcodec".to_string(), args.encoder.codec.clone());
         if let Some(crf) = args.encoder.crf {
             map.insert("crf".to_string(), crf.to_string());
         }
