@@ -66,7 +66,7 @@ pub struct TypstVideoRenderer {
 }
 
 impl TypstVideoRenderer {
-    #[instrument(skip_all)]
+    #[cfg_attr(feature = "tracy", instrument(skip_all))]
     pub fn new(
         ppi: f32,
         f_input: impl Fn(i32) -> Dict + 'static + Send + Sync,
@@ -81,7 +81,7 @@ impl TypstVideoRenderer {
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip(self)))]
     fn render_frame(&self, t: i32) -> Result<tiny_skia::Pixmap, Error> {
         let world = self.universe.snapshot_with(Some(TaskInputs {
             entry: None,
@@ -94,7 +94,7 @@ impl TypstVideoRenderer {
         Ok(render(frame, self.ppi / 72.0))
     }
 
-    #[instrument(level = "debug", skip(pixmap))]
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip(pixmap)))]
     fn process_frame(pixmap: Pixmap) -> Result<Array3<u8>, Error> {
         let width = pixmap.width();
         let height = pixmap.height();
@@ -132,7 +132,7 @@ impl TypstVideoRenderer {
         )?)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip(self)))]
     pub fn render(
         self,
         begin_t: i32,
@@ -140,9 +140,11 @@ impl TypstVideoRenderer {
         fps: i32,
         error_signal: Arc<AtomicBool>,
     ) -> Result<Vec<u8>, Error> {
+        #[cfg(feature = "tracy")]
         let root_span = debug_span!("render");
         let rendering_span = info_span!("rendering");
         let encoding_span = info_span!("encoding");
+        #[cfg(feature = "tracy")]
         let _enter = root_span.enter();
 
         let sty = ProgressStyle::with_template(
@@ -191,11 +193,6 @@ impl TypstVideoRenderer {
 
         for i in 0..num_encode_workers {
             let chunk_begin_t = begin_t + i as i32 * frames_per_worker;
-            let chunk_end_t = if i == num_encode_workers - 1 {
-                end_t
-            } else {
-                chunk_begin_t + frames_per_worker
-            };
 
             let (frame_tx, frame_rx) = channel::bounded::<(i32, Vec<u8>)>(num_render_workers * 4);
             chunk_frame_txs.push(frame_tx);
@@ -250,6 +247,7 @@ impl TypstVideoRenderer {
                             if stop_signal.load(Ordering::SeqCst) {
                                 break;
                             }
+                            #[cfg(feature = "tracy")]
                             let _span = tracing::debug_span!("worker_frame", t = t).entered();
                             let chunk_index = ((t - begin_t) / frames_per_worker)
                                 .min(num_encode_workers as i32 - 1)
@@ -363,7 +361,7 @@ impl TypstVideoRenderer {
         Ok(buf)
     }
 
-    #[instrument(level = "debug", skip_all, fields(output_path = %output_path))]
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all, fields(output_path = %output_path)))]
     #[allow(clippy::too_many_arguments)]
     fn encode_video(
         rx: channel::Receiver<(i32, Vec<u8>)>,
@@ -394,6 +392,7 @@ impl TypstVideoRenderer {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
             }
+            #[cfg(feature = "tracy")]
             let _span = tracing::debug_span!("encoder_recv", frame_num = frame_num).entered();
             received_frames.insert(frame_num, frame);
             while let Some(raw_frame) = received_frames.remove(&next_expected) {
@@ -404,6 +403,7 @@ impl TypstVideoRenderer {
                     Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
                 let timestamp =
                     Time::from_secs((next_expected - video_begin_t) as f32 / fps as f32);
+                #[cfg(feature = "tracy")]
                 let _encode_span =
                     tracing::debug_span!("encode_frame", frame_num = next_expected).entered();
                 if let Err(e) = encoder.encode(&frame, timestamp) {
@@ -416,6 +416,7 @@ impl TypstVideoRenderer {
                 {
                     p.pb_inc(1);
                 }
+                #[cfg(feature = "tracy")]
                 drop(_encode_span);
                 next_expected += 1;
             }
@@ -428,6 +429,7 @@ impl TypstVideoRenderer {
                     Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
                 let timestamp =
                     Time::from_secs((next_expected - video_begin_t) as f32 / fps as f32);
+                #[cfg(feature = "tracy")]
                 let _encode_span =
                     tracing::debug_span!("encode_remaining_frame", frame_num = next_expected)
                         .entered();
@@ -439,6 +441,7 @@ impl TypstVideoRenderer {
                 if let Some(p) = &encode_progress {
                     p.pb_inc(1);
                 }
+                #[cfg(feature = "tracy")]
                 drop(_encode_span);
                 next_expected += 1;
             }
@@ -452,7 +455,7 @@ impl TypstVideoRenderer {
         Ok(())
     }
 }
-
+#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
 fn merge_mp4_files(
     input_files: Vec<&str>,
     output_file: &str,
