@@ -182,6 +182,7 @@ impl TypstVideoRenderer {
 
         let self_arc = std::sync::Arc::new(self);
         let _re = rendering_span.enter();
+        let _en = encoding_span.enter();
 
         let frames_per_worker = (end_t - begin_t) / num_encode_workers as i32;
         let mut chunk_frame_txs = Vec::new();
