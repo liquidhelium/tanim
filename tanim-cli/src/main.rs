@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::AtomicBool};
 
 use clap::{Parser, builder::ValueParser};
-use tanim_cli::video::TypstVideoRenderer;
+use tanim_cli::video::{config::RenderConfig, TypstVideoRenderer};
 use tinymist_world::args::CompileOnceArgs;
 use tracing::{error, info};
 use tracing_indicatif::IndicatifLayer;
@@ -87,18 +87,25 @@ fn main() -> anyhow::Result<()> {
         map
     };
 
-    let renderer = TypstVideoRenderer::new(
-        args.ppi,
-        move |t| Dict::from_iter([(Str::from(args.variable.clone()), Value::Int(t.into()))]),
-        univ,
-        encoder_option_hashmap,
-    );
+    let config = RenderConfig {
+        universe: univ,
+        ppi: args.ppi,
+        f_input: Box::new(move |t| {
+            Dict::from_iter([(Str::from(args.variable.clone()), Value::Int(t.into()))])
+        }),
+        ffmpeg_options: encoder_option_hashmap,
+        begin_t: *args.frames.start(),
+        end_t: *args.frames.end(),
+        fps: 24,
+    };
+
+    let renderer = TypstVideoRenderer::new(config);
 
     let error_signal = Arc::new(AtomicBool::new(false));
 
     let render_thread = std::thread::Builder::new()
         .name("render".to_string())
-        .spawn(move || renderer.render(*args.frames.start(), *args.frames.end(), 24, error_signal))
+        .spawn(move || renderer.render(error_signal))
         .unwrap();
 
     let data = match render_thread.join().unwrap() {
