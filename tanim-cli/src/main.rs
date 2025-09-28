@@ -2,7 +2,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 use clap::{Parser, builder::ValueParser};
 use tanim_cli::video::{config::RenderConfig, TypstVideoRenderer};
-use tinymist_world::args::CompileOnceArgs;
+use tinymist_world::{args::CompileOnceArgs, print_diagnostics};
 use tracing::{error, info};
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
         map.insert("preset".to_string(), args.encoder.preset.clone());
         map
     };
+    let world = univ.snapshot();
 
     let config = RenderConfig {
         universe: univ,
@@ -111,6 +112,17 @@ fn main() -> anyhow::Result<()> {
     let data = match render_thread.join().unwrap() {
         Ok(data) => data,
         Err(e) => {
+            if let tanim_cli::video::error::Error::TypstCompilation(diags) = &e {
+                if let Err(e) =  print_diagnostics(
+                    &world,
+                    diags.iter(),
+                    tinymist_world::DiagnosticFormat::Human,
+                ) {
+                    error!("Error printing diagnostics: {e}");
+                }
+            } else {
+                error!("Error during rendering: {e}");
+            }
             return Err(e.into());
         }
     };

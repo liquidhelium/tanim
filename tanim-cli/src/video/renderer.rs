@@ -6,18 +6,18 @@ use std::{
     io::Read,
     path::PathBuf,
     sync::{
-        Arc, Once,
+        Arc, Mutex, Once,
         atomic::{AtomicBool, Ordering},
     },
     thread,
 };
 use tiny_skia::Pixmap;
-use tinymist_world::TaskInputs;
-use tracing::{Span, info, info_span};
+use tinymist_world::{print_diagnostics, system::SystemWorldComputeGraph, CompileSnapshot, TaskInputs};
+use tracing::{error, info, info_span, Span};
 #[cfg(feature = "tracy")]
 use tracing::{debug_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
-use typst::{layout::PagedDocument, utils::LazyHash};
+use typst::{diag::Warned, layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
 use video_rs::{Encoder, Location, Time};
 
@@ -80,10 +80,8 @@ impl FrameEncoder {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
             }
-            let frame = Array3::from_shape_vec(
-                (self.height as usize, self.width as usize, 3),
-                raw_frame,
-            )?;
+            let frame =
+                Array3::from_shape_vec((self.height as usize, self.width as usize, 3), raw_frame)?;
             let timestamp =
                 Time::from_secs((self.next_expected - self.video_begin_t) as f32 / self.fps as f32);
             #[cfg(feature = "tracy")]
@@ -105,10 +103,8 @@ impl FrameEncoder {
     fn finish(mut self, encode_progress: Option<&Span>) -> Result<()> {
         // After the channel is closed, process any remaining frames in the map.
         while let Some(raw_frame) = self.received_frames.remove(&self.next_expected) {
-            let frame = Array3::from_shape_vec(
-                (self.height as usize, self.width as usize, 3),
-                raw_frame,
-            )?;
+            let frame =
+                Array3::from_shape_vec((self.height as usize, self.width as usize, 3), raw_frame)?;
             let timestamp =
                 Time::from_secs((self.next_expected - self.video_begin_t) as f32 / self.fps as f32);
             #[cfg(feature = "tracy")]
@@ -131,23 +127,45 @@ impl FrameEncoder {
 
 pub struct TypstVideoRenderer {
     config: RenderConfig,
+    cache_graph: Arc<Mutex<Option<Arc<SystemWorldComputeGraph>>>>,
 }
 
 impl TypstVideoRenderer {
     #[cfg_attr(feature = "tracy", instrument(skip_all))]
     pub fn new(config: RenderConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            cache_graph: Arc::new(Mutex::new(None)),
+        }
     }
 
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip(self)))]
     fn render_frame(&self, t: i32) -> Result<tiny_skia::Pixmap> {
-        let world = self.config.universe.snapshot_with(Some(TaskInputs {
+        let mut lock = self.cache_graph.lock().unwrap();
+        let base_world = lock.get_or_insert_with(|| {
+            SystemWorldComputeGraph::new(CompileSnapshot::from_world(
+                self.config.universe.snapshot_with(Some(TaskInputs {
+                    entry: None,
+                    inputs: Some(Arc::new(LazyHash::new((self.config.f_input)(t)))) ,
+                })),
+            ))
+        });
+        let world = base_world.task(TaskInputs {
             entry: None,
             inputs: Some(Arc::new(LazyHash::new((self.config.f_input)(t)))),
-        }));
-        let doc: PagedDocument = typst::compile(&world)
-            .output
-            .map_err(|e| Error::TypstCompilation(e.to_vec()))?;
+        });
+        let Warned {
+                output,
+                warnings,
+            } = world.pure_compile();
+        let doc: Arc<PagedDocument> = {
+            if let Err(e) = print_diagnostics(world.world(), warnings.iter(), tinymist_world::DiagnosticFormat::Human) {
+                error!("Error printing diagnostics: {e}");
+            };
+            output.map_err(Error::TypstCompilation)?
+        };
+
+
         let frame = doc.pages.first().ok_or(Error::NoPages)?;
         Ok(render(frame, self.config.ppi / 72.0))
     }
@@ -464,12 +482,9 @@ impl TypstVideoRenderer {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
             }
-            if let Err(e) = encoder.encode_frame(
-                frame_num,
-                frame,
-                encode_progress.as_ref(),
-                &stop_signal,
-            ) {
+            if let Err(e) =
+                encoder.encode_frame(frame_num, frame, encode_progress.as_ref(), &stop_signal)
+            {
                 stop_signal.store(true, Ordering::SeqCst);
                 error_signal.store(true, Ordering::SeqCst);
                 return Err(e);

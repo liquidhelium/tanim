@@ -1,10 +1,10 @@
 use thiserror::Error;
-use typst::diag::SourceDiagnostic;
+use typst::{diag::SourceDiagnostic, ecow::EcoVec};
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Typst compilation failed: {0:?}")]
-    TypstCompilation(Vec<SourceDiagnostic>),
+    TypstCompilation(EcoVec<SourceDiagnostic>),
 
     #[error("No pages in the document")]
     NoPages,
