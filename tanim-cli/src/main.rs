@@ -1,17 +1,14 @@
-use std::sync::{
-    atomic::AtomicBool,
-    Arc,
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
-use clap::{builder::ValueParser, Parser};
+use clap::{Parser, builder::ValueParser};
 use tanim_cli::video::TypstVideoRenderer;
 use tinymist_world::args::CompileOnceArgs;
-use tracing::info;
+use tracing::{error, info};
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use typst::foundations::{Dict, Str, Value};
 
-#[derive(Debug, Clone, Parser,)]
+#[derive(Debug, Clone, Parser)]
 pub struct Args {
     #[clap(flatten)]
     pub compile_once: CompileOnceArgs,
@@ -58,19 +55,25 @@ pub struct EncoderArgs {
 fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let indicatif_layer = IndicatifLayer::new();
-    tracing_subscriber::registry()
+    let re = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
-        .with(indicatif_layer)
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "tanim_cli=info,video=warn,ffmpeg=error".into()),
-        )
-        .init();
+        .with(indicatif_layer);
+    #[cfg(feature = "tracy")]
+    let re = {
+        re.with(tracing_tracy::TracyLayer::new(
+            tracing_tracy::DefaultConfig::default(),
+        ))
+    };
+    re.with(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "tanim_cli=info,video=warn,ffmpeg=error".into()),
+    )
+    .init();
     let args = Args::parse();
     let univ = match args.compile_once.resolve_system() {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("Error resolving system: {e}");
+            error!("Error resolving system: {e}");
             return Err(e.into());
         }
     };
@@ -83,7 +86,7 @@ fn main() -> anyhow::Result<()> {
         map.insert("preset".to_string(), args.encoder.preset.clone());
         map
     };
-    
+
     let renderer = TypstVideoRenderer::new(
         args.ppi,
         move |t| Dict::from_iter([(Str::from(args.variable.clone()), Value::Int(t.into()))]),
@@ -95,14 +98,7 @@ fn main() -> anyhow::Result<()> {
 
     let render_thread = std::thread::Builder::new()
         .name("render".to_string())
-        .spawn(move || {
-            renderer.render(
-                *args.frames.start(),
-                *args.frames.end(),
-                24,
-                error_signal,
-            )
-        })
+        .spawn(move || renderer.render(*args.frames.start(), *args.frames.end(), 24, error_signal))
         .unwrap();
 
     let data = match render_thread.join().unwrap() {
