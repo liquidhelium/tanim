@@ -4,7 +4,7 @@ use ndarray::Array3;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Once,
         atomic::{AtomicBool, Ordering},
@@ -18,7 +18,7 @@ use tracing::{Span, debug_span, info, info_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use typst::{diag::SourceDiagnostic, foundations::Dict, layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
-use video_rs::{Encoder, Location, Time};
+use video_rs::{Encoder, Location, MuxerBuilder, Reader, Time, Writer};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -54,6 +54,9 @@ pub enum Error {
 
     #[error("Failed to create temp file for video encoding")]
     TempFileCreation(#[source] std::io::Error),
+
+    #[error("Failed to merge video chunks: {0}")]
+    MergeVideoChunks(String),
 }
 pub struct TypstVideoRenderer {
     universe: TypstSystemUniverse,
@@ -173,38 +176,90 @@ impl TypstVideoRenderer {
             return Err(Error::NoPages);
         }
 
-        let num_workers = (num_cpus::get() - 2).max(1);
-        let (frame_tx, frame_rx) = channel::bounded::<(i32, Vec<u8>)>(num_workers*4);
-        let (task_tx, task_rx) = channel::bounded::<i32>(num_workers*4);
+        let num_render_workers = (num_cpus::get() - 2).max(1);
+        let num_encode_workers = (num_cpus::get() / 4).max(1);
+        let (task_tx, task_rx) = channel::bounded::<i32>(num_render_workers * 4);
 
-        let mut file = tempfile::Builder::new().suffix(".mp4").tempfile()?;
-        let output_path = file.path().to_owned();
         let self_arc = std::sync::Arc::new(self);
         let _re = rendering_span.enter();
-        let workers: Vec<_> = (0..num_workers)
+
+        let frames_per_worker = (end_t - begin_t) / num_encode_workers as i32;
+        let mut chunk_frame_txs = Vec::new();
+        let mut encode_threads = Vec::new();
+        let mut output_files = Vec::new();
+
+        for i in 0..num_encode_workers {
+            let chunk_begin_t = begin_t + i as i32 * frames_per_worker;
+            let chunk_end_t = if i == num_encode_workers - 1 {
+                end_t
+            } else {
+                chunk_begin_t + frames_per_worker
+            };
+
+            let (frame_tx, frame_rx) = channel::bounded::<(i32, Vec<u8>)>(num_render_workers * 4);
+            chunk_frame_txs.push(frame_tx);
+
+            let file = tempfile::Builder::new()
+                .suffix(&format!("_{i}.mp4"))
+                .tempfile()
+                .map_err(Error::TempFileCreation)?;
+
+            let output_path = file.path().to_owned();
+            output_files.push(file);
+
+            let ffmpeg_options = self_arc.ffmpeg_options.clone();
+            let stop_signal = stop_signal.clone();
+            let error_signal = error_signal.clone();
+            let encoding_span = encoding_span.clone();
+            let video_begin_t = begin_t;
+
+            let encode_thread = thread::Builder::new()
+                .name(format!("encoder-{i}"))
+                .spawn(move || {
+                    Self::encode_video(
+                        frame_rx,
+                        width,
+                        height,
+                        fps,
+                        &output_path.to_string_lossy(),
+                        chunk_begin_t,
+                        video_begin_t,
+                        Some(encoding_span),
+                        ffmpeg_options,
+                        stop_signal,
+                        error_signal,
+                    )
+                })
+                .unwrap();
+            encode_threads.push(encode_thread);
+        }
+
+        let render_workers: Vec<_> = (0..num_render_workers)
             .map(|i| {
                 let task_rx = task_rx.clone();
-                let frame_tx = frame_tx.clone();
+                let chunk_frame_txs = chunk_frame_txs.clone();
                 let self_clone = self_arc.clone();
                 let stop_signal = stop_signal.clone();
                 let error_signal = error_signal.clone();
                 let pb_render = rendering_span.clone();
                 thread::Builder::new()
-                    .name(format!("worker-{i}"))
+                    .name(format!("render-worker-{i}"))
                     .spawn(move || {
                         while let Ok(t) = task_rx.recv() {
                             if stop_signal.load(Ordering::SeqCst) {
                                 break;
                             }
                             let _span = tracing::debug_span!("worker_frame", t = t).entered();
+                            let chunk_index = ((t - begin_t) / frames_per_worker)
+                                .min(num_encode_workers as i32 - 1)
+                                as usize;
                             match self_clone.render_frame(t) {
                                 Ok(pixmap) => match Self::process_frame(pixmap) {
                                     Ok(frame) => {
-                                        if frame_tx
+                                        if chunk_frame_txs[chunk_index]
                                             .send((t, frame.into_raw_vec_and_offset().0))
                                             .is_err()
                                         {
-                                            // Encoder thread has likely panicked, stop sending.
                                             break;
                                         }
                                         if !stop_signal.load(Ordering::SeqCst) {
@@ -230,45 +285,22 @@ impl TypstVideoRenderer {
                     .unwrap()
             })
             .collect();
-        let _e = encoding_span.enter();
-        let encode_thread = {
-            let ffmpeg_options = self_arc.ffmpeg_options.clone();
-            let stop_signal = stop_signal.clone();
-            let error_signal = error_signal.clone();
-            let encoding_span = encoding_span.clone();
-            thread::Builder::new()
-                .name("encoder".to_string())
-                .spawn(move || {
-                    Self::encode_video(
-                        frame_rx,
-                        width,
-                        height,
-                        fps,
-                        &output_path.to_string_lossy(),
-                        begin_t,
-                        Some(encoding_span),
-                        ffmpeg_options,
-                        stop_signal,
-                        error_signal,
-                    )
-                })
-                .unwrap()
-        };
 
         for t in begin_t..end_t {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
             }
             if task_tx.send(t).is_err() {
-                // All workers have panicked or exited, no point in sending more tasks.
                 break;
             }
         }
 
         drop(task_tx);
-        drop(frame_tx);
+        for tx in chunk_frame_txs {
+            drop(tx);
+        }
 
-        for worker in workers {
+        for worker in render_workers {
             worker.join().map_err(|e| {
                 Error::ThreadPanic(
                     e.downcast_ref::<&'static str>()
@@ -278,27 +310,36 @@ impl TypstVideoRenderer {
                 )
             })?;
         }
-        let encode_result = encode_thread.join().map_err(|e| {
-            Error::ThreadPanic(
-                e.downcast_ref::<&'static str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| e.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "Unknown panic in encoder thread".to_string()),
-            )
-        })?;
 
-        // Propagate errors from inside the encode thread
-        encode_result?;
+        for thread in encode_threads {
+            let encode_result = thread.join().map_err(|e| {
+                Error::ThreadPanic(
+                    e.downcast_ref::<&'static str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| e.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "Unknown panic in encoder thread".to_string()),
+                )
+            })?;
+            encode_result?;
+        }
+
         if stop_signal.load(Ordering::SeqCst) {
             return Err(Error::RenderOrEncode);
         }
 
-        {
-            let mut buf = vec![];
-            let res = file.read_to_end(&mut buf);
-            res.map(|_| buf)
-        }
-        .map_err(Error::Io)
+        let mut output_file = tempfile::Builder::new().suffix(".mp4").tempfile()?;
+        let final_output_path = output_file.path().to_string_lossy().to_string();
+        let input_paths_str: Vec<&str> = output_files
+            .iter()
+            .map(|p| p.path().to_str().unwrap())
+            .collect();
+
+        merge_mp4_files(input_paths_str, &final_output_path)
+            .map_err(|e| Error::MergeVideoChunks(e.to_string()))?;
+
+        let mut buf = Vec::new();
+        output_file.read_to_end(&mut buf)?;
+        Ok(buf)
     }
 
     #[instrument(level = "debug", skip_all, fields(output_path = %output_path))]
@@ -310,6 +351,7 @@ impl TypstVideoRenderer {
         fps: i32,
         output_path: &str,
         begin_t: i32,
+        video_begin_t: i32,
         encode_progress: Option<Span>,
         ffmpeg_options: HashMap<String, String>,
         stop_signal: Arc<AtomicBool>,
@@ -339,7 +381,8 @@ impl TypstVideoRenderer {
                 }
                 let frame =
                     Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
-                let timestamp = Time::from_secs((next_expected - begin_t) as f32 / fps as f32);
+                let timestamp =
+                    Time::from_secs((next_expected - video_begin_t) as f32 / fps as f32);
                 let _encode_span =
                     tracing::debug_span!("encode_frame", frame_num = next_expected).entered();
                 if let Err(e) = encoder.encode(&frame, timestamp) {
@@ -362,7 +405,8 @@ impl TypstVideoRenderer {
             while let Some(raw_frame) = received_frames.remove(&next_expected) {
                 let frame =
                     Array3::from_shape_vec((height as usize, width as usize, 3), raw_frame)?;
-                let timestamp = Time::from_secs((next_expected - begin_t) as f32 / fps as f32);
+                let timestamp =
+                    Time::from_secs((next_expected - video_begin_t) as f32 / fps as f32);
                 let _encode_span =
                     tracing::debug_span!("encode_remaining_frame", frame_num = next_expected)
                         .entered();
@@ -386,4 +430,45 @@ impl TypstVideoRenderer {
         }
         Ok(())
     }
+}
+
+fn merge_mp4_files(
+    input_files: Vec<&str>,
+    output_file: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // 创建输出写入器
+    let writer = Writer::new(Path::new(output_file))?;
+    let mut muxer_builder = MuxerBuilder::new(writer);
+
+    // 创建读取器并添加流
+    let mut readers = Vec::new();
+    for input_file in &input_files {
+        let reader = Reader::new(Path::new(input_file))?;
+        muxer_builder = muxer_builder.with_streams(&reader)?;
+        readers.push(reader);
+    }
+
+    // 构建 muxer
+    let mut muxer = muxer_builder.build();
+
+    // 处理每个文件的数据包
+    for mut reader in readers {
+        // 获取最佳视频流索引
+        let stream_index = reader
+            .input
+            .streams()
+            .find(|stream| stream.parameters().medium() == video_rs::ffmpeg::media::Type::Video)
+            .map(|stream| stream.index())
+            .unwrap_or(0);
+
+        // 读取并合并数据包
+        while let Ok(packet) = reader.read(stream_index) {
+            muxer.mux(packet)?;
+        }
+    }
+
+    // 完成合并
+    muxer.finish()?;
+
+    Ok(output_file.to_string())
 }
