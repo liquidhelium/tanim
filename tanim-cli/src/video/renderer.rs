@@ -176,8 +176,10 @@ impl TypstVideoRenderer {
         });
         let world = universe.snapshot();
         drop(universe); // release the lock as soon as possible
-        let _span = info_span!("compilation", frame = t).entered();
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("compilation", frame = t).entered();
         let Warned { output, warnings } = typst::compile(&world);
+        #[cfg(feature = "tracy")]
         drop(_span);
         let doc: PagedDocument = {
             if let Err(e) = print_diagnostics(
@@ -309,7 +311,7 @@ impl TypstVideoRenderer {
         let num_render_workers = self
             .config
             .rendering_threads
-            .unwrap_or_else(|| (num_cpus::get() - 4).clamp(1, (end_t - begin_t + 1) as usize));
+            .unwrap_or_else(|| (num_cpus::get() - 2).clamp(1, (end_t - begin_t + 1) as usize));
         let num_encode_workers = self.config.encoding_threads.unwrap_or_else(|| {
             (num_cpus::get() - num_render_workers).clamp(1, (end_t - begin_t + 1) as usize)
         });
@@ -318,7 +320,7 @@ impl TypstVideoRenderer {
         let mut encoder_senders = Vec::with_capacity(num_encode_workers);
         let mut encoder_receivers = Vec::with_capacity(num_encode_workers);
         for _ in 0..num_encode_workers {
-            let (tx, rx) = channel::bounded(num_encode_workers * 4);
+            let (tx, rx) = channel::bounded(32);
             encoder_senders.push(tx);
             encoder_receivers.push(rx);
         }
