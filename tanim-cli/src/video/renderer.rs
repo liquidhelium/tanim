@@ -1,4 +1,3 @@
-use core::num;
 use crossbeam::channel;
 use indicatif::ProgressStyle;
 use ndarray::Array3;
@@ -7,13 +6,13 @@ use std::{
     io::Read,
     path::PathBuf,
     sync::{
-        Arc, Mutex, Once, OnceLock,
+        Arc, Once, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
 };
 use tiny_skia::Pixmap;
-use tinymist_world::{TaskInputs, print_diagnostics, system::SystemWorldComputeGraph};
+use tinymist_world::print_diagnostics;
 use tracing::{Span, error, info, info_span};
 #[cfg(feature = "tracy")]
 use tracing::{debug_span, instrument};
@@ -28,14 +27,16 @@ use super::{
     merger::merge_mp4_files,
 };
 
+type EncoderSenderVec = Vec<channel::Sender<(i32, Vec<u8>)>>;
+
 #[derive(Clone)]
 struct FrameDispatcher {
-    encoders_senders: Arc<Vec<channel::Sender<(i32, Vec<u8>)>>>,
+    encoders_senders: Arc<EncoderSenderVec>,
     frames_per_encoder: i32,
 }
 
 impl FrameDispatcher {
-    fn new(senders: Vec<channel::Sender<(i32, Vec<u8>)>>, frames_per_encoder: i32) -> Self {
+    fn new(senders: EncoderSenderVec, frames_per_encoder: i32) -> Self {
         Self {
             encoders_senders: Arc::new(senders),
             frames_per_encoder,
@@ -44,14 +45,14 @@ impl FrameDispatcher {
 
     fn dispatch(&self, frame_num: i32, frame: Vec<u8>, begin_t: i32) {
         let target_encoder_index = (frame_num - begin_t) / self.frames_per_encoder;
-        if let Some(sender) = self.encoders_senders.get(target_encoder_index as usize) {
-            if sender.send((frame_num, frame)).is_err() {
-                // Encoder thread might have panicked and closed the channel.
-                // This will be handled when the main thread tries to join the encoder thread.
-                error!(
-                    "Failed to send frame {frame_num} to encoder {target_encoder_index} - channel closed"
-                );
-            }
+        if let Some(sender) = self.encoders_senders.get(target_encoder_index as usize)
+            && sender.send((frame_num, frame)).is_err()
+        {
+            // Encoder thread might have panicked and closed the channel.
+            // This will be handled when the main thread tries to join the encoder thread.
+            error!(
+                "Failed to send frame {frame_num} to encoder {target_encoder_index} - channel closed"
+            );
         }
     }
 }
@@ -158,6 +159,12 @@ pub struct TypstVideoRenderer {
     config: RenderConfig,
     size: OnceLock<(u32, u32)>,
 }
+
+struct SpawnRenderWorkersResult(
+    Vec<thread::JoinHandle<Result<()>>>,
+    Vec<tempfile::NamedTempFile>,
+    Vec<thread::JoinHandle<()>>,
+);
 
 impl TypstVideoRenderer {
     #[cfg_attr(feature = "tracy", instrument(skip_all))]
@@ -300,11 +307,7 @@ impl TypstVideoRenderer {
         encoding_span: Span,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
-    ) -> (
-        Vec<thread::JoinHandle<Result<()>>>,
-        Vec<tempfile::NamedTempFile>,
-        Vec<thread::JoinHandle<()>>,
-    ) {
+    ) -> SpawnRenderWorkersResult {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
         // each worker should handle at least one frame
@@ -345,8 +348,7 @@ impl TypstVideoRenderer {
             encoder_receivers,
         );
 
-
-        (encode_threads, temp_files, render_threads)
+        SpawnRenderWorkersResult(encode_threads, temp_files, render_threads)
     }
 
     fn spawn_encoder_workers(
@@ -493,11 +495,11 @@ impl TypstVideoRenderer {
 
     fn wait_for_workers(
         &self,
-        (encode_threads, temp_files, render_threads): (
-            Vec<thread::JoinHandle<Result<()>>>,
-            Vec<tempfile::NamedTempFile>,
-            Vec<thread::JoinHandle<()>>,
-        ),
+        SpawnRenderWorkersResult (
+            encode_threads,
+            temp_files,
+            render_threads,
+        ): SpawnRenderWorkersResult,
     ) -> Result<Vec<tempfile::NamedTempFile>> {
         for render_thread in render_threads {
             render_thread.join().map_err(|e| {
