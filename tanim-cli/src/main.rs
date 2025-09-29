@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 use clap::{Parser, builder::ValueParser};
 use tanim_cli::video::{config::RenderConfig, TypstVideoRenderer};
@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
     let world = univ.snapshot();
 
     let config = RenderConfig {
-        universe: univ,
+        universe: Arc::new(Mutex::new(univ)),
         ppi: args.ppi,
         f_input: Box::new(move |t| {
             Dict::from_iter([(Str::from(args.variable.clone()), Value::Int(t.into()))])

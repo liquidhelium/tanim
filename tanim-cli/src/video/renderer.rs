@@ -12,8 +12,8 @@ use std::{
     thread,
 };
 use tiny_skia::Pixmap;
-use tinymist_world::{print_diagnostics, system::SystemWorldComputeGraph, CompileSnapshot, TaskInputs};
-use tracing::{error, info, info_span, Span};
+use tinymist_world::{TaskInputs, print_diagnostics, system::SystemWorldComputeGraph};
+use tracing::{Span, error, info, info_span};
 #[cfg(feature = "tracy")]
 use tracing::{debug_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
@@ -127,44 +127,32 @@ impl FrameEncoder {
 
 pub struct TypstVideoRenderer {
     config: RenderConfig,
-    cache_graph: Arc<Mutex<Option<Arc<SystemWorldComputeGraph>>>>,
 }
 
 impl TypstVideoRenderer {
     #[cfg_attr(feature = "tracy", instrument(skip_all))]
     pub fn new(config: RenderConfig) -> Self {
-        Self {
-            config,
-            cache_graph: Arc::new(Mutex::new(None)),
-        }
+        Self { config }
     }
 
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip(self)))]
     fn render_frame(&self, t: i32) -> Result<tiny_skia::Pixmap> {
-        let mut lock = self.cache_graph.lock().unwrap();
-        let base_world = lock.get_or_insert_with(|| {
-            SystemWorldComputeGraph::new(CompileSnapshot::from_world(
-                self.config.universe.snapshot_with(Some(TaskInputs {
-                    entry: None,
-                    inputs: Some(Arc::new(LazyHash::new((self.config.f_input)(t)))) ,
-                })),
-            ))
+        let mut universe = self.config.universe.lock().unwrap();
+        universe.increment_revision(|univ| {
+            univ.set_inputs(Arc::new(LazyHash::new((self.config.f_input)(t))));
         });
-        let world = base_world.task(TaskInputs {
-            entry: None,
-            inputs: Some(Arc::new(LazyHash::new((self.config.f_input)(t)))),
-        });
-        let Warned {
-                output,
-                warnings,
-            } = world.pure_compile();
-        let doc: Arc<PagedDocument> = {
-            if let Err(e) = print_diagnostics(world.world(), warnings.iter(), tinymist_world::DiagnosticFormat::Human) {
+        let world = universe.snapshot();
+        let Warned { output, warnings } = typst::compile(&world);
+        let doc: PagedDocument = {
+            if let Err(e) = print_diagnostics(
+                &world,
+                warnings.iter(),
+                tinymist_world::DiagnosticFormat::Human,
+            ) {
                 error!("Error printing diagnostics: {e}");
             };
             output.map_err(Error::TypstCompilation)?
         };
-
 
         let frame = doc.pages.first().ok_or(Error::NoPages)?;
         Ok(render(frame, self.config.ppi / 72.0))
@@ -287,7 +275,7 @@ impl TypstVideoRenderer {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
         let fps = self.config.fps;
-        let num_encode_workers = (num_cpus::get() / 4).max(1);
+        let num_encode_workers = (num_cpus::get() - 2).max(1);
         let frames_per_worker = (end_t - begin_t) / num_encode_workers as i32;
 
         let _re = rendering_span.enter();
@@ -491,12 +479,12 @@ impl TypstVideoRenderer {
             }
         }
 
-        if !stop_signal.load(Ordering::SeqCst) {
-            if let Err(e) = encoder.finish(encode_progress.as_ref()) {
-                stop_signal.store(true, Ordering::SeqCst);
-                error_signal.store(true, Ordering::SeqCst);
-                return Err(e);
-            }
+        if !stop_signal.load(Ordering::SeqCst)
+            && let Err(e) = encoder.finish(encode_progress.as_ref())
+        {
+            stop_signal.store(true, Ordering::SeqCst);
+            error_signal.store(true, Ordering::SeqCst);
+            return Err(e);
         }
 
         Ok(())

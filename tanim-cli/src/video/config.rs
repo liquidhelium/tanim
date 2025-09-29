@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::{Arc, Mutex}};
 use tinymist_world::TypstSystemUniverse;
 use typst::foundations::Dict;
 
 pub struct RenderConfig {
-    pub universe: TypstSystemUniverse,
+    pub universe: Arc<Mutex<TypstSystemUniverse>>,
     pub ppi: f32,
     pub f_input: Box<dyn Fn(i32) -> Dict + 'static + Send + Sync>,
     pub ffmpeg_options: HashMap<String, String>,
