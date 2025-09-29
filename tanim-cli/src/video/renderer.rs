@@ -162,13 +162,14 @@ impl TypstVideoRenderer {
         Self { config }
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip(self)))]
+    #[cfg_attr(feature = "tracy", instrument(level = "trace", skip(self)))]
     fn render_frame(&self, t: i32) -> Result<tiny_skia::Pixmap> {
         let mut universe = self.config.universe.lock().unwrap();
         universe.increment_revision(|univ| {
             univ.set_inputs(Arc::new(LazyHash::new((self.config.f_input)(t))));
         });
         let world = universe.snapshot();
+        drop(universe); // release the lock as soon as possible
         #[cfg(feature = "tracy")]
         let _span = debug_span!("compilation", frame = t).entered();
         let Warned { output, warnings } = typst::compile(&world);
@@ -305,8 +306,9 @@ impl TypstVideoRenderer {
     ) {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
-        let num_render_workers = self.config.rendering_threads.unwrap_or_else(|| (num_cpus::get() - 4).max(1));
-        let num_encode_workers = self.config.encoding_threads.unwrap_or_else(|| (num_cpus::get() - num_render_workers).max(1));
+        // each worker should handle at least one frame
+        let num_render_workers = self.config.rendering_threads.unwrap_or_else(|| (num_cpus::get() - 4).clamp(1, (end_t - begin_t + 1) as usize));
+        let num_encode_workers = self.config.encoding_threads.unwrap_or_else(|| (num_cpus::get() - num_render_workers).clamp(1, (end_t - begin_t + 1) as usize));
         let frames_per_encoder = (end_t - begin_t) / num_encode_workers as i32;
 
         let mut encoder_senders = Vec::with_capacity(num_encode_workers);
