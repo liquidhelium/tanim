@@ -305,8 +305,8 @@ impl TypstVideoRenderer {
     ) {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
-        let num_render_workers = self.config.encoding_threads.unwrap_or_else(|| (num_cpus::get() - 4).max(1));
-        let num_encode_workers = self.config.rendering_threads.unwrap_or_else(|| (num_cpus::get() - num_render_workers).max(1));
+        let num_render_workers = self.config.rendering_threads.unwrap_or_else(|| (num_cpus::get() - 4).max(1));
+        let num_encode_workers = self.config.encoding_threads.unwrap_or_else(|| (num_cpus::get() - num_render_workers).max(1));
         let frames_per_encoder = (end_t - begin_t) / num_encode_workers as i32;
 
         let mut encoder_senders = Vec::with_capacity(num_encode_workers);
