@@ -1,6 +1,7 @@
 use crossbeam::channel;
 use indicatif::ProgressStyle;
 use ndarray::Array3;
+use core::num;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
@@ -26,6 +27,32 @@ use super::{
     error::{Error, Result},
     merger::merge_mp4_files,
 };
+
+#[derive(Clone)]
+struct FrameDispatcher {
+    encoders_senders: Arc<Vec<channel::Sender<(i32, Vec<u8>)>>>,
+    frames_per_encoder: i32,
+}
+
+impl FrameDispatcher {
+    fn new(senders: Vec<channel::Sender<(i32, Vec<u8>)>>, frames_per_encoder: i32) -> Self {
+        Self {
+            encoders_senders: Arc::new(senders),
+            frames_per_encoder,
+        }
+    }
+
+    fn dispatch(&self, frame_num: i32, frame: Vec<u8>, begin_t: i32) {
+        let target_encoder_index = (frame_num - begin_t) / self.frames_per_encoder;
+        if let Some(sender) = self.encoders_senders.get(target_encoder_index as usize) {
+            if sender.send((frame_num, frame)).is_err() {
+                // Encoder thread might have panicked and closed the channel.
+                // This will be handled when the main thread tries to join the encoder thread.
+                error!("Failed to send frame {frame_num} to encoder {target_encoder_index} - channel closed");
+            }
+        }
+    }
+}
 
 struct FrameEncoder {
     encoder: Encoder,
@@ -142,7 +169,11 @@ impl TypstVideoRenderer {
             univ.set_inputs(Arc::new(LazyHash::new((self.config.f_input)(t))));
         });
         let world = universe.snapshot();
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("compilation", frame = t).entered();
         let Warned { output, warnings } = typst::compile(&world);
+        #[cfg(feature = "tracy")]
+        drop(_span);
         let doc: PagedDocument = {
             if let Err(e) = print_diagnostics(
                 &world,
@@ -267,85 +298,147 @@ impl TypstVideoRenderer {
         encoding_span: Span,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
-    ) -> Vec<(
-        thread::JoinHandle<Result<()>>,
-        tempfile::NamedTempFile,
-        thread::JoinHandle<()>,
-    )> {
+    ) -> (
+        Vec<thread::JoinHandle<Result<()>>>,
+        Vec<tempfile::NamedTempFile>,
+        Vec<thread::JoinHandle<()>>,
+    ) {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
-        let fps = self.config.fps;
-        let num_encode_workers = (num_cpus::get() - 2).max(1);
-        let frames_per_worker = (end_t - begin_t) / num_encode_workers as i32;
+        let num_render_workers = self.config.encoding_threads.unwrap_or_else(|| (num_cpus::get() - 4).max(1));
+        let num_encode_workers = self.config.rendering_threads.unwrap_or_else(|| (num_cpus::get() - num_render_workers).max(1));
+        let frames_per_encoder = (end_t - begin_t) / num_encode_workers as i32;
+
+        let mut encoder_senders = Vec::with_capacity(num_encode_workers);
+        let mut encoder_receivers = Vec::with_capacity(num_encode_workers);
+        for _ in 0..num_encode_workers {
+            let (tx, rx) = channel::bounded(num_encode_workers * 4);
+            encoder_senders.push(tx);
+            encoder_receivers.push(rx);
+        }
+
+        let dispatcher = FrameDispatcher::new(encoder_senders, frames_per_encoder);
 
         let _re = rendering_span.enter();
         let _en = encoding_span.enter();
 
-        (0..num_encode_workers)
+        let (encode_threads, temp_files) = self.spawn_encoder_workers(
+            width,
+            height,
+            encoding_span.clone(),
+            stop_signal.clone(),
+            error_signal.clone(),
+            encoder_receivers,
+        );
+
+        let render_threads = self.spawn_renderer_workers(
+            rendering_span.clone(),
+            stop_signal,
+            error_signal,
+            dispatcher,
+            num_render_workers
+        );
+
+        (encode_threads, temp_files, render_threads)
+    }
+
+    fn spawn_encoder_workers(
+        self: &Arc<Self>,
+        width: u32,
+        height: u32,
+        encoding_span: Span,
+        stop_signal: Arc<AtomicBool>,
+        error_signal: Arc<AtomicBool>,
+        encoder_receivers: Vec<channel::Receiver<(i32, Vec<u8>)>>,
+    ) -> (Vec<thread::JoinHandle<Result<()>>>, Vec<tempfile::NamedTempFile>) {
+        let num_encode_workers = encoder_receivers.len();
+        let begin_t = self.config.begin_t;
+        let end_t = self.config.end_t;
+        let fps = self.config.fps;
+        let frames_per_encoder = (end_t - begin_t) / num_encode_workers as i32;
+
+        let mut encode_threads = Vec::with_capacity(num_encode_workers);
+        let mut temp_files = Vec::with_capacity(num_encode_workers);
+
+        for (i, frame_rx) in encoder_receivers.into_iter().enumerate() {
+            let chunk_begin_t = begin_t + i as i32 * frames_per_encoder;
+            let file = tempfile::Builder::new()
+                .suffix(&format!("_{i}.mp4"))
+                .tempfile()
+                .map_err(Error::TempFileCreation)
+                .unwrap();
+            let output_path = file.path().to_owned();
+            temp_files.push(file);
+
+            let ffmpeg_options = self.config.ffmpeg_options.clone();
+            let stop_signal1 = stop_signal.clone();
+            let error_signal1 = error_signal.clone();
+            let encoding_span = encoding_span.clone();
+            let video_begin_t = begin_t;
+
+            let encode_thread = thread::Builder::new()
+                .name(format!("encoder-{i}"))
+                .spawn(move || {
+                    Self::encode_video(
+                        frame_rx,
+                        width,
+                        height,
+                        fps,
+                        &output_path.to_string_lossy(),
+                        chunk_begin_t,
+                        video_begin_t,
+                        Some(encoding_span),
+                        ffmpeg_options,
+                        stop_signal1,
+                        error_signal1,
+                    )
+                })
+                .unwrap();
+            encode_threads.push(encode_thread);
+        }
+        (encode_threads, temp_files)
+    }
+
+    fn spawn_renderer_workers(
+        self: &Arc<Self>,
+        rendering_span: Span,
+        stop_signal: Arc<AtomicBool>,
+        error_signal: Arc<AtomicBool>,
+        dispatcher: FrameDispatcher,
+        count: usize
+    ) -> Vec<thread::JoinHandle<()>> {
+        let begin_t = self.config.begin_t;
+        let end_t = self.config.end_t;
+        let frames_per_renderer = (end_t - begin_t) / count as i32;
+
+        (0..count)
             .map(|i| {
-                let chunk_begin_t = begin_t + i as i32 * frames_per_worker;
-                let chunk_end_t = if i == num_encode_workers - 1 {
+                let chunk_begin_t = begin_t + i as i32 * frames_per_renderer;
+                let chunk_end_t = if i == count - 1 {
                     end_t
                 } else {
-                    chunk_begin_t + frames_per_worker
+                    chunk_begin_t + frames_per_renderer
                 };
-
-                let (frame_tx, frame_rx) =
-                    channel::bounded::<(i32, Vec<u8>)>(num_encode_workers * 4);
-
-                let file = tempfile::Builder::new()
-                    .suffix(&format!("_{i}.mp4"))
-                    .tempfile()
-                    .map_err(Error::TempFileCreation)
-                    .unwrap();
-
-                let output_path = file.path().to_owned();
-
-                let ffmpeg_options = self.config.ffmpeg_options.clone();
-                let stop_signal1 = stop_signal.clone();
-                let error_signal1 = error_signal.clone();
-                let encoding_span = encoding_span.clone();
-                let video_begin_t = begin_t;
-
-                let encode_thread = thread::Builder::new()
-                    .name(format!("encoder-{i}"))
-                    .spawn(move || {
-                        Self::encode_video(
-                            frame_rx,
-                            width,
-                            height,
-                            fps,
-                            &output_path.to_string_lossy(),
-                            chunk_begin_t,
-                            video_begin_t,
-                            Some(encoding_span),
-                            ffmpeg_options,
-                            stop_signal1,
-                            error_signal1,
-                        )
-                    })
-                    .unwrap();
 
                 let self_clone = self.clone();
                 let rendering_span_clone = rendering_span.clone();
                 let stop_signal_clone = stop_signal.clone();
                 let error_signal_clone = error_signal.clone();
+                let dispatcher_clone = dispatcher.clone();
 
-                let render_thread = thread::Builder::new()
+                thread::Builder::new()
                     .name(format!("renderer-{i}"))
                     .spawn(move || {
                         self_clone.render_chunk(
                             chunk_begin_t,
                             chunk_end_t,
-                            frame_tx,
+                            dispatcher_clone,
                             rendering_span_clone,
                             stop_signal_clone,
                             error_signal_clone,
                         );
                     })
-                    .unwrap();
-
-                (encode_thread, file, render_thread)
+                    .unwrap()
             })
             .collect()
     }
@@ -354,11 +447,12 @@ impl TypstVideoRenderer {
         &self,
         chunk_begin_t: i32,
         chunk_end_t: i32,
-        frame_tx: channel::Sender<(i32, Vec<u8>)>,
+        dispatcher: FrameDispatcher,
         rendering_span: Span,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
     ) {
+        let begin_t = self.config.begin_t;
         for t in chunk_begin_t..chunk_end_t {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
@@ -366,12 +460,7 @@ impl TypstVideoRenderer {
             match self.render_frame(t) {
                 Ok(pixmap) => match Self::process_frame(pixmap) {
                     Ok(frame) => {
-                        if frame_tx
-                            .send((t, frame.into_raw_vec_and_offset().0))
-                            .is_err()
-                        {
-                            break;
-                        }
+                        dispatcher.dispatch(t, frame.into_raw_vec_and_offset().0, begin_t);
                         if !stop_signal.load(Ordering::SeqCst) {
                             rendering_span.pb_inc(1);
                         }
@@ -395,15 +484,13 @@ impl TypstVideoRenderer {
 
     fn wait_for_workers(
         &self,
-        results: Vec<(
-            thread::JoinHandle<Result<()>>,
-            tempfile::NamedTempFile,
-            thread::JoinHandle<()>,
-        )>,
+        (encode_threads, temp_files, render_threads): (
+            Vec<thread::JoinHandle<Result<()>>>,
+            Vec<tempfile::NamedTempFile>,
+            Vec<thread::JoinHandle<()>>,
+        ),
     ) -> Result<Vec<tempfile::NamedTempFile>> {
-        let mut output_files = Vec::new();
-        for (encode_thread, file, render_thread) in results {
-            output_files.push(file);
+        for render_thread in render_threads {
             render_thread.join().map_err(|e| {
                 Error::ThreadPanic(
                     e.downcast_ref::<&'static str>()
@@ -412,6 +499,9 @@ impl TypstVideoRenderer {
                         .unwrap_or_else(|| "Unknown panic in renderer thread".to_string()),
                 )
             })?;
+        }
+
+        for encode_thread in encode_threads {
             let encode_result = encode_thread.join().map_err(|e| {
                 Error::ThreadPanic(
                     e.downcast_ref::<&'static str>()
@@ -422,7 +512,8 @@ impl TypstVideoRenderer {
             })?;
             encode_result?;
         }
-        Ok(output_files)
+
+        Ok(temp_files)
     }
 
     fn merge_video_chunks(&self, output_files: Vec<tempfile::NamedTempFile>) -> Result<Vec<u8>> {

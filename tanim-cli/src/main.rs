@@ -20,6 +20,13 @@ pub struct Args {
     pub frames: std::ops::RangeInclusive<i32>,
     #[clap(long, default_value = "150.0")]
     pub ppi: f32,
+    /// Number of rendering threads to use (default: number of CPUs - 4, minimum 1)
+    #[clap(long = "rthreads")]
+    pub rendering_threads: Option<usize>,
+    /// Number of encoding threads will be number of CPUs - rendering threads (minimum 1)
+    #[clap(long = "ethreads")]
+    pub encoding_threads: Option<usize>,
+    /// Encoder options
     #[clap(flatten)]
     pub encoder: EncoderArgs,
 }
@@ -98,6 +105,8 @@ fn main() -> anyhow::Result<()> {
         begin_t: *args.frames.start(),
         end_t: *args.frames.end(),
         fps: 24,
+        rendering_threads: args.rendering_threads,
+        encoding_threads: args.encoding_threads,
     };
 
     let renderer = TypstVideoRenderer::new(config);
