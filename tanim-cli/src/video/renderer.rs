@@ -1,13 +1,13 @@
+use core::num;
 use crossbeam::channel;
 use indicatif::ProgressStyle;
 use ndarray::Array3;
-use core::num;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
     path::PathBuf,
     sync::{
-        Arc, Mutex, Once,
+        Arc, Mutex, Once, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -48,7 +48,9 @@ impl FrameDispatcher {
             if sender.send((frame_num, frame)).is_err() {
                 // Encoder thread might have panicked and closed the channel.
                 // This will be handled when the main thread tries to join the encoder thread.
-                error!("Failed to send frame {frame_num} to encoder {target_encoder_index} - channel closed");
+                error!(
+                    "Failed to send frame {frame_num} to encoder {target_encoder_index} - channel closed"
+                );
             }
         }
     }
@@ -154,12 +156,16 @@ impl FrameEncoder {
 
 pub struct TypstVideoRenderer {
     config: RenderConfig,
+    size: OnceLock<(u32, u32)>,
 }
 
 impl TypstVideoRenderer {
     #[cfg_attr(feature = "tracy", instrument(skip_all))]
     pub fn new(config: RenderConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            size: OnceLock::new(),
+        }
     }
 
     #[cfg_attr(feature = "tracy", instrument(level = "trace", skip(self)))]
@@ -170,10 +176,8 @@ impl TypstVideoRenderer {
         });
         let world = universe.snapshot();
         drop(universe); // release the lock as soon as possible
-        #[cfg(feature = "tracy")]
-        let _span = debug_span!("compilation", frame = t).entered();
+        let _span = info_span!("compilation", frame = t).entered();
         let Warned { output, warnings } = typst::compile(&world);
-        #[cfg(feature = "tracy")]
         drop(_span);
         let doc: PagedDocument = {
             if let Err(e) = print_diagnostics(
@@ -187,7 +191,14 @@ impl TypstVideoRenderer {
         };
 
         let frame = doc.pages.first().ok_or(Error::NoPages)?;
-        Ok(render(frame, self.config.ppi / 72.0))
+        let pixmap = render(frame, self.config.ppi / 72.0);
+        // It's okay to ignore the result here, as we don't care if the size was already set.
+        // divide by 2 and multiply by 2 to ensure even dimensions, which is required by many video codecs.
+        let _ = self.size.set((
+            pixmap.width() as u32 / 2 * 2,
+            pixmap.height() as u32 / 2 * 2,
+        ));
+        Ok(pixmap)
     }
 
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip(pixmap)))]
@@ -229,12 +240,10 @@ impl TypstVideoRenderer {
     }
 
     pub fn render(self, error_signal: Arc<AtomicBool>) -> Result<Vec<u8>> {
-        let (width, height, rendering_span, encoding_span, stop_signal) = self.prepare_render()?;
+        let (rendering_span, encoding_span, stop_signal) = self.prepare_render()?;
         let self_arc = Arc::new(self);
 
         let results = self_arc.spawn_render_workers(
-            width,
-            height,
             rendering_span,
             encoding_span,
             stop_signal.clone(),
@@ -250,7 +259,7 @@ impl TypstVideoRenderer {
         self_arc.merge_video_chunks(output_files)
     }
 
-    fn prepare_render(&self) -> Result<(u32, u32, Span, Span, Arc<AtomicBool>)> {
+    fn prepare_render(&self) -> Result<(Span, Span, Arc<AtomicBool>)> {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
 
@@ -280,21 +289,11 @@ impl TypstVideoRenderer {
             video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Error);
         });
 
-        let sample_frame = self.render_frame(begin_t)?;
-        let width = sample_frame.width() / 2 * 2;
-        let height = sample_frame.height() / 2 * 2;
-
-        if width == 0 || height == 0 {
-            return Err(Error::NoPages);
-        }
-
-        Ok((width, height, rendering_span, encoding_span, stop_signal))
+        Ok((rendering_span, encoding_span, stop_signal))
     }
 
     fn spawn_render_workers(
         self: &Arc<Self>,
-        width: u32,
-        height: u32,
         rendering_span: Span,
         encoding_span: Span,
         stop_signal: Arc<AtomicBool>,
@@ -307,8 +306,13 @@ impl TypstVideoRenderer {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
         // each worker should handle at least one frame
-        let num_render_workers = self.config.rendering_threads.unwrap_or_else(|| (num_cpus::get() - 4).clamp(1, (end_t - begin_t + 1) as usize));
-        let num_encode_workers = self.config.encoding_threads.unwrap_or_else(|| (num_cpus::get() - num_render_workers).clamp(1, (end_t - begin_t + 1) as usize));
+        let num_render_workers = self
+            .config
+            .rendering_threads
+            .unwrap_or_else(|| (num_cpus::get() - 4).clamp(1, (end_t - begin_t + 1) as usize));
+        let num_encode_workers = self.config.encoding_threads.unwrap_or_else(|| {
+            (num_cpus::get() - num_render_workers).clamp(1, (end_t - begin_t + 1) as usize)
+        });
         let frames_per_encoder = (end_t - begin_t) / num_encode_workers as i32;
 
         let mut encoder_senders = Vec::with_capacity(num_encode_workers);
@@ -323,36 +327,37 @@ impl TypstVideoRenderer {
 
         let _re = rendering_span.enter();
         let _en = encoding_span.enter();
-
-        let (encode_threads, temp_files) = self.spawn_encoder_workers(
-            width,
-            height,
-            encoding_span.clone(),
+        // spawn render workers first to ensure encoder can get size info
+        let render_threads = self.spawn_renderer_workers(
+            rendering_span.clone(),
             stop_signal.clone(),
             error_signal.clone(),
+            dispatcher,
+            num_render_workers,
+        );
+
+        let (encode_threads, temp_files) = self.spawn_encoder_workers(
+            encoding_span.clone(),
+            stop_signal,
+            error_signal,
             encoder_receivers,
         );
 
-        let render_threads = self.spawn_renderer_workers(
-            rendering_span.clone(),
-            stop_signal,
-            error_signal,
-            dispatcher,
-            num_render_workers
-        );
 
         (encode_threads, temp_files, render_threads)
     }
 
     fn spawn_encoder_workers(
         self: &Arc<Self>,
-        width: u32,
-        height: u32,
         encoding_span: Span,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
         encoder_receivers: Vec<channel::Receiver<(i32, Vec<u8>)>>,
-    ) -> (Vec<thread::JoinHandle<Result<()>>>, Vec<tempfile::NamedTempFile>) {
+    ) -> (
+        Vec<thread::JoinHandle<Result<()>>>,
+        Vec<tempfile::NamedTempFile>,
+    ) {
+        let &(width, height) = self.size.wait();
         let num_encode_workers = encoder_receivers.len();
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
@@ -407,7 +412,7 @@ impl TypstVideoRenderer {
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
         dispatcher: FrameDispatcher,
-        count: usize
+        count: usize,
     ) -> Vec<thread::JoinHandle<()>> {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
