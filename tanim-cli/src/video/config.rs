@@ -12,4 +12,5 @@ pub struct RenderConfig {
     pub fps: u32,
     pub rendering_threads: Option<usize>,
     pub encoding_threads: Option<usize>,
+    pub zstd_level: Option<i32>,
 }

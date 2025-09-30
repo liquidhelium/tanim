@@ -24,6 +24,7 @@ indicatif = "0.18.0"
 tracing-indicatif = "0.3.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "registry"] }
 tracing-tracy = {version = "0.11.4", optional = true}
+zstd = "0.13.1"
 
 [features]
 tracy = ["dep:tracing-tracy"]

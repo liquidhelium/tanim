@@ -31,6 +31,9 @@ pub struct Args {
     /// Encoder options
     #[clap(flatten)]
     pub encoder: EncoderArgs,
+    /// Zstd compression level for frames before sending to encoder
+    #[clap(long)]
+    pub zstd_level: Option<i32>,
 }
 
 fn parse_range(s: &str) -> Result<std::ops::RangeInclusive<i32>, String> {
@@ -109,6 +112,7 @@ fn main() -> anyhow::Result<()> {
         fps: args.fps,
         rendering_threads: args.rendering_threads,
         encoding_threads: args.encoding_threads,
+        zstd_level: args.zstd_level,
     };
 
     let renderer = TypstVideoRenderer::new(config);

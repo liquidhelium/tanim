@@ -65,9 +65,11 @@ struct FrameEncoder {
     height: u32,
     fps: u32,
     video_begin_t: i32,
+    zstd_level: Option<i32>,
 }
 
 impl FrameEncoder {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         output_path: &str,
         width: u32,
@@ -76,6 +78,7 @@ impl FrameEncoder {
         begin_t: i32,
         video_begin_t: i32,
         ffmpeg_options: HashMap<String, String>,
+        zstd_level: Option<i32>,
     ) -> Result<Self> {
         info!("using ffmpeg options: {ffmpeg_options:?}");
         let settings = video_rs::encode::Settings::preset_h264_custom(
@@ -93,6 +96,7 @@ impl FrameEncoder {
             height,
             fps,
             video_begin_t,
+            zstd_level,
         })
     }
 
@@ -106,10 +110,15 @@ impl FrameEncoder {
         #[cfg(feature = "tracy")]
         let _span = tracing::debug_span!("encoder_recv", frame_num = frame_num).entered();
         self.received_frames.insert(frame_num, frame);
-        while let Some(raw_frame) = self.received_frames.remove(&self.next_expected) {
+        while let Some(received_frame) = self.received_frames.remove(&self.next_expected) {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
             }
+            let raw_frame = if self.zstd_level.is_some() {
+                zstd::decode_all(&received_frame[..]).unwrap()
+            } else {
+                received_frame
+            };
             let frame =
                 Array3::from_shape_vec((self.height as usize, self.width as usize, 3), raw_frame)?;
             let timestamp =
@@ -382,6 +391,7 @@ impl TypstVideoRenderer {
             temp_files.push(file);
 
             let ffmpeg_options = self.config.ffmpeg_options.clone();
+            let zstd_level = self.config.zstd_level;
             let stop_signal1 = stop_signal.clone();
             let error_signal1 = error_signal.clone();
             let encoding_span = encoding_span.clone();
@@ -400,6 +410,7 @@ impl TypstVideoRenderer {
                         video_begin_t,
                         Some(encoding_span),
                         ffmpeg_options,
+                        zstd_level,
                         stop_signal1,
                         error_signal1,
                     )
@@ -471,7 +482,13 @@ impl TypstVideoRenderer {
             match self.render_frame(t) {
                 Ok(pixmap) => match Self::process_frame(pixmap) {
                     Ok(frame) => {
-                        dispatcher.dispatch(t, frame.into_raw_vec_and_offset().0, begin_t);
+                        let raw_frame = frame.into_raw_vec_and_offset().0;
+                        let frame_to_dispatch = if let Some(level) = self.config.zstd_level {
+                            zstd::encode_all(&raw_frame[..], level).unwrap()
+                        } else {
+                            raw_frame
+                        };
+                        dispatcher.dispatch(t, frame_to_dispatch, begin_t);
                         if !stop_signal.load(Ordering::SeqCst) {
                             rendering_span.pb_inc(1);
                         }
@@ -555,6 +572,7 @@ impl TypstVideoRenderer {
         video_begin_t: i32,
         encode_progress: Option<Span>,
         ffmpeg_options: HashMap<String, String>,
+        zstd_level: Option<i32>,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
     ) -> Result<()> {
@@ -566,6 +584,7 @@ impl TypstVideoRenderer {
             begin_t,
             video_begin_t,
             ffmpeg_options,
+            zstd_level,
         )?;
 
         for (frame_num, frame) in rx {
