@@ -9,7 +9,7 @@ pub struct RenderConfig {
     pub ffmpeg_options: HashMap<String, String>,
     pub begin_t: i32,
     pub end_t: i32,
-    pub fps: i32,
+    pub fps: u32,
     pub rendering_threads: Option<usize>,
     pub encoding_threads: Option<usize>,
 }

@@ -1,6 +1,6 @@
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
-use clap::{Parser, builder::ValueParser};
+use clap::{builder::ValueParser, Parser};
 use tanim_cli::video::{config::RenderConfig, TypstVideoRenderer};
 use tinymist_world::{args::CompileOnceArgs, print_diagnostics};
 use tracing::{error, info};
@@ -18,6 +18,8 @@ pub struct Args {
     pub output: String,
     #[clap(long, short, default_value = "0..=240", value_parser = ValueParser::new(parse_range))]
     pub frames: std::ops::RangeInclusive<i32>,
+    #[clap(long, default_value = "24", value_parser = clap::value_parser!(u32).range(1..))]
+    pub fps: u32,
     #[clap(long, default_value = "150.0")]
     pub ppi: f32,
     /// Number of rendering threads to use (default: number of CPUs - 4, minimum 1)
@@ -104,7 +106,7 @@ fn main() -> anyhow::Result<()> {
         ffmpeg_options: encoder_option_hashmap,
         begin_t: *args.frames.start(),
         end_t: *args.frames.end(),
-        fps: 24,
+        fps: args.fps,
         rendering_threads: args.rendering_threads,
         encoding_threads: args.encoding_threads,
     };

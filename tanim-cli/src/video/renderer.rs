@@ -63,7 +63,7 @@ struct FrameEncoder {
     next_expected: i32,
     width: u32,
     height: u32,
-    fps: i32,
+    fps: u32,
     video_begin_t: i32,
 }
 
@@ -72,7 +72,7 @@ impl FrameEncoder {
         output_path: &str,
         width: u32,
         height: u32,
-        fps: i32,
+        fps: u32,
         begin_t: i32,
         video_begin_t: i32,
         ffmpeg_options: HashMap<String, String>,
@@ -549,7 +549,7 @@ impl TypstVideoRenderer {
         rx: channel::Receiver<(i32, Vec<u8>)>,
         width: u32,
         height: u32,
-        fps: i32,
+        fps: u32,
         output_path: &str,
         begin_t: i32,
         video_begin_t: i32,
