@@ -191,6 +191,8 @@ impl TypstVideoRenderer {
             univ.set_inputs(Arc::new(LazyHash::new((self.config.f_input)(t))));
         });
         let world = universe.snapshot();
+        universe.evict(10);
+        typst::comemo::evict(10);
         drop(universe); // release the lock as soon as possible
         #[cfg(feature = "tracy")]
         let _span = debug_span!("compilation", frame = t).entered();
