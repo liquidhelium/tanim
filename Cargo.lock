@@ -3214,6 +3214,7 @@ dependencies = [
  "indicatif",
  "ndarray",
  "num_cpus",
+ "once_cell",
  "tempfile",
  "thiserror 2.0.16",
  "tiny-skia",
