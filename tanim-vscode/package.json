@@ -1,0 +1,95 @@
+{
+  "name": "tanim-slider",
+  "displayName": "Tanim Slider",
+  "description": "A VS Code extension that adds a slider in the status bar for Typst files to control animation parameters",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:typst"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tanim-slider",
+          "title": "Tanim Slider",
+          "icon": "$(symbol-numeric)"
+        }
+      ]
+    },
+    "views": {
+      "tanim-slider": [
+        {
+          "type": "webview",
+          "id": "tanim-slider.view",
+          "name": "Animation Slider"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Tanim Slider",
+      "properties": {
+        "tanim-slider.minValue": {
+          "type": "number",
+          "default": 0,
+          "description": "Minimum value for the slider"
+        },
+        "tanim-slider.maxValue": {
+          "type": "number",
+          "default": 100,
+          "description": "Maximum value for the slider"
+        },
+        "tanim-slider.defaultValue": {
+          "type": "number",
+          "default": 0,
+          "description": "Default value for the slider"
+        },
+        "tanim-slider.searchPatterns": {
+          "type": "array",
+          "default": [
+            {
+              "pattern": "sys\\.inputs\\.at\\(\\s*[\"']t[\"']\\s*,\\s*default:\\s*(\\d+(?:\\.\\d+)?)\\s*\\)",
+              "replacement": "sys.inputs.at(\"t\", default: ${value})"
+            }
+          ],
+          "description": "Regex patterns to search and replace in Typst files. Each pattern should have a 'pattern' (regex string) and 'replacement' (string with ${value} placeholder)",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "type": "string",
+                "description": "Regular expression pattern to match (use \\d+ to match numbers)"
+              },
+              "replacement": {
+                "type": "string",
+                "description": "Replacement string (use ${value} as placeholder for the slider value)"
+              }
+            },
+            "required": ["pattern", "replacement"]
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "@types/node": "^18.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}
