@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "args": [
+      "--extensionDevelopmentPath=${workspaceFolder}/tanim-vscode"
+      ],
+      "name": "Launch Extension",
+      "outFiles": [
+      "${workspaceFolder}/tanim-vscode/out/**/*.js"
+      ],
+      "preLaunchTask": "npm: compile - tanim-vscode",
+      "request": "launch",
+      "type": "extensionHost"
+    },
+  ]
+}
