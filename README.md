@@ -1,5 +1,7 @@
 # Tanim
 
+The idea of creating animations using typst comes from [WenSim](https://github.com/WenSimEHRP). His bash script renders each frame as a .png file, then merge them into a video. This project can be seen as a statically linked, concurrent version of his script.
+
 ## CLI
 
 Tanim CLI is a command-line tool for creating animations and videos using [Typst](https://typst.app/). It allows you to render Typst documents into a video file, by varying a numerical variable over a range of frames.
