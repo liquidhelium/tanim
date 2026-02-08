@@ -8,7 +8,7 @@ Tanim CLI is a command-line tool for creating animations and videos using [Typst
 
 ## Features
 
-*   Render Typst documents to video. Both embedded typst and typst executable are supported
+*   Render Typst documents to video. Both embedded typst and typst executable are supported.
 *   Customize frame range, resolution (PPI), and video encoder options.
 *   Pass a variable to your Typst file that changes with each frame.
 
