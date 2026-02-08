@@ -171,7 +171,7 @@ impl FrameEncoder {
             {
                 let output_file_cstr = CString::new(output_path).unwrap();
                 let mut output_ctx =
-                    AVFormatContextOutput::create(output_file_cstr.as_c_str(), None)?;
+                    AVFormatContextOutput::create(output_file_cstr.as_c_str())?;
 
                 let codec = ffmpeg_options
                     .get("codec")
