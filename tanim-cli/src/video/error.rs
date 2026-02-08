@@ -12,8 +12,13 @@ pub enum Error {
     #[error("Failed to create ndarray from shape: {0}")]
     NDArrayShape(#[from] ndarray::ShapeError),
 
+    #[cfg(feature = "embedded-ffmpeg")]
     #[error("Video encoding failed: {0}")]
     VideoEncoding(#[from] rsmpeg::error::RsmpegError),
+
+    #[cfg(feature = "ffmpeg-bin")]
+    #[error("FFmpeg binary error: {0}")]
+    FFmpegBinary(#[from] anyhow::Error),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

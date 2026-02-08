@@ -16,4 +16,5 @@ pub struct RenderConfig {
     pub rendering_threads: Option<usize>,
     pub encoding_threads: Option<usize>,
     pub zstd_level: Option<i32>,
+    pub ffmpeg_path: Option<String>,
 }

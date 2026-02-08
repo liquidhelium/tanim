@@ -1,6 +1,7 @@
 use crossbeam::channel;
 use indicatif::ProgressStyle;
 use ndarray::Array3;
+#[cfg(feature = "embedded-ffmpeg")]
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avformat::AVFormatContextOutput,
@@ -9,7 +10,13 @@ use rsmpeg::{
     ffi,
     swscale::SwsContext,
 };
+#[cfg(feature = "embedded-ffmpeg")]
 use std::ffi::CString;
+
+#[cfg(feature = "ffmpeg-bin")]
+use std::io::Write;
+#[cfg(feature = "ffmpeg-bin")]
+use std::process::{Child, Command, Stdio};
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
@@ -64,13 +71,30 @@ impl FrameDispatcher {
     }
 }
 
-struct FrameEncoder {
+#[cfg(feature = "embedded-ffmpeg")]
+struct RsmpegData {
     encode_ctx: AVCodecContext,
     output_ctx: AVFormatContextOutput,
     frame: AVFrame,
     input_frame: AVFrame,
     sws_ctx: SwsContext,
     stream_index: usize,
+}
+
+#[cfg(feature = "ffmpeg-bin")]
+struct BinaryData {
+    process: Child,
+}
+
+enum EncoderBackend {
+    #[cfg(feature = "embedded-ffmpeg")]
+    Rsmpeg(RsmpegData),
+    #[cfg(feature = "ffmpeg-bin")]
+    Binary(BinaryData),
+}
+
+struct FrameEncoder {
+    backend: EncoderBackend,
     received_frames: BTreeMap<i32, Vec<u8>>,
     next_expected: i32,
     width: u32,
@@ -91,90 +115,163 @@ impl FrameEncoder {
         video_begin_t: i32,
         ffmpeg_options: HashMap<String, String>,
         zstd_level: Option<i32>,
+        ffmpeg_path: Option<String>,
     ) -> Result<Self> {
         info!("using ffmpeg options: {ffmpeg_options:?}");
 
-        let output_file_cstr = CString::new(output_path).unwrap();
-        let mut output_ctx = AVFormatContextOutput::create(output_file_cstr.as_c_str(), None)?;
+        #[cfg(all(feature = "embedded-ffmpeg", feature = "ffmpeg-bin"))]
+        let use_binary = ffmpeg_path.is_some();
 
-        let codec = AVCodec::find_encoder_by_name(
-            std::ffi::CStr::from_bytes_with_nul(b"libx264\0").unwrap(),
-        )
-        .or_else(|| AVCodec::find_encoder(ffi::AV_CODEC_ID_H264))
-        .expect("H.264 encoder not found");
+        #[cfg(all(feature = "ffmpeg-bin", not(feature = "embedded-ffmpeg")))]
+        let use_binary = true;
 
-        let mut encode_ctx = AVCodecContext::new(&codec);
-        encode_ctx.set_height(height as i32);
-        encode_ctx.set_width(width as i32);
-        encode_ctx.set_time_base(AVRational {
-            num: 1,
-            den: fps as i32,
-        });
-        encode_ctx.set_framerate(AVRational {
-            num: fps as i32,
-            den: 1,
-        });
-        encode_ctx.set_pix_fmt(ffi::AV_PIX_FMT_YUV420P);
+        #[cfg(all(not(feature = "ffmpeg-bin"), feature = "embedded-ffmpeg"))]
+        let use_binary = false;
 
-        let mut options_dict: Option<AVDictionary> = None;
-        for (k, v) in ffmpeg_options {
-            let k = CString::new(k).unwrap();
-            let v = CString::new(v).unwrap();
-            options_dict = match options_dict {
-                Some(dict) => Some(dict.set(&k, &v, 0)),
-                None => Some(AVDictionary::new(&k, &v, 0)),
-            };
-        }
+        let backend = if use_binary {
+            #[cfg(feature = "ffmpeg-bin")]
+            {
+                let mut cmd = Command::new(ffmpeg_path.as_deref().unwrap_or("ffmpeg"));
+                cmd.arg("-loglevel").arg("error");
+                cmd.arg("-y")
+                    .arg("-f")
+                    .arg("rawvideo")
+                    .arg("-pixel_format")
+                    .arg("rgb24")
+                    .arg("-video_size")
+                    .arg(format!("{}x{}", width, height))
+                    .arg("-framerate")
+                    .arg(fps.to_string())
+                    .arg("-i")
+                    .arg("-");
 
-        if output_ctx.oformat().flags & ffi::AVFMT_GLOBALHEADER as i32 != 0 {
-            encode_ctx.set_flags(encode_ctx.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
-        }
+                for (k, v) in ffmpeg_options {
+                    cmd.arg(format!("-{}", k)).arg(v);
+                }
 
-        encode_ctx.open(options_dict)?;
+                cmd.arg("-pix_fmt").arg("yuv420p");
+                cmd.arg(output_path).stdin(Stdio::piped());
 
-        let stream_index = {
-            let mut stream = output_ctx.new_stream();
-            stream.set_codecpar(encode_ctx.extract_codecpar());
-            stream.set_time_base(encode_ctx.time_base);
-            stream.index as usize
+                let process = cmd
+                    .spawn()
+                    .map_err(|e| anyhow::anyhow!("Failed to spawn ffmpeg: {}", e))?;
+                EncoderBackend::Binary(BinaryData { process })
+            }
+            #[cfg(not(feature = "ffmpeg-bin"))]
+            {
+                unreachable!("use_binary should be false if ffmpeg-bin is not enabled")
+            }
+        } else {
+            #[cfg(feature = "embedded-ffmpeg")]
+            {
+                let output_file_cstr = CString::new(output_path).unwrap();
+                let mut output_ctx =
+                    AVFormatContextOutput::create(output_file_cstr.as_c_str(), None)?;
+
+                let codec = ffmpeg_options
+                    .get("codec")
+                    .map(|c| {
+                        match AVCodec::find_encoder_by_name(&std::ffi::CString::new(
+                            c.clone(),
+                        ).ok()?) {
+                            Some(c) => Some(c),
+                            None => {
+                                error!("Cannot find a codec with name {c:?}. Falling back to libx264 instead");
+                                None
+                            }
+                        }
+                    })
+                    .flatten()
+                    .or_else(|| {
+                        AVCodec::find_encoder_by_name(
+                            std::ffi::CStr::from_bytes_with_nul(b"libx264\0").unwrap(),
+                        )
+                        .or_else(|| AVCodec::find_encoder(ffi::AV_CODEC_ID_H264))
+                    })
+                    .expect("H.264 encoder not found");
+
+                let mut encode_ctx = AVCodecContext::new(&codec);
+                encode_ctx.set_height(height as i32);
+                encode_ctx.set_width(width as i32);
+                encode_ctx.set_time_base(AVRational {
+                    num: 1,
+                    den: fps as i32,
+                });
+                encode_ctx.set_framerate(AVRational {
+                    num: fps as i32,
+                    den: 1,
+                });
+                encode_ctx.set_pix_fmt(ffi::AV_PIX_FMT_YUV420P);
+
+                let mut options_dict: Option<AVDictionary> = None;
+                for (k, v) in ffmpeg_options {
+                    let k = CString::new(k).unwrap();
+                    let v = CString::new(v).unwrap();
+                    options_dict = match options_dict {
+                        Some(dict) => Some(dict.set(&k, &v, 0)),
+                        None => Some(AVDictionary::new(&k, &v, 0)),
+                    };
+                }
+
+                if output_ctx.oformat().flags & ffi::AVFMT_GLOBALHEADER as i32 != 0 {
+                    encode_ctx
+                        .set_flags(encode_ctx.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
+                }
+
+                encode_ctx.open(options_dict)?;
+
+                let stream_index = {
+                    let mut stream = output_ctx.new_stream();
+                    stream.set_codecpar(encode_ctx.extract_codecpar());
+                    stream.set_time_base(encode_ctx.time_base);
+                    stream.index as usize
+                };
+
+                output_ctx.dump(0, output_file_cstr.as_c_str())?;
+                output_ctx.write_header(&mut None)?;
+
+                let mut frame = AVFrame::new();
+                frame.set_format(encode_ctx.pix_fmt);
+                frame.set_width(encode_ctx.width);
+                frame.set_height(encode_ctx.height);
+                frame.alloc_buffer()?;
+
+                let mut input_frame = AVFrame::new();
+                input_frame.set_format(ffi::AV_PIX_FMT_RGB24);
+                input_frame.set_width(width as i32);
+                input_frame.set_height(height as i32);
+                input_frame.alloc_buffer()?;
+
+                let sws_ctx = SwsContext::get_context(
+                    width as i32,
+                    height as i32,
+                    ffi::AV_PIX_FMT_RGB24,
+                    width as i32,
+                    height as i32,
+                    ffi::AV_PIX_FMT_YUV420P,
+                    ffi::SWS_BILINEAR,
+                    None,
+                    None,
+                    None,
+                )
+                .ok_or(Error::SwsContextCreation)?;
+                EncoderBackend::Rsmpeg(RsmpegData {
+                    encode_ctx,
+                    output_ctx,
+                    frame,
+                    input_frame,
+                    sws_ctx,
+                    stream_index,
+                })
+            }
+            #[cfg(not(feature = "embedded-ffmpeg"))]
+            {
+                unreachable!("use_binary should be true if embedded-ffmpeg is not enabled")
+            }
         };
 
-        output_ctx.dump(0, output_file_cstr.as_c_str())?;
-        output_ctx.write_header(&mut None)?;
-
-        let mut frame = AVFrame::new();
-        frame.set_format(encode_ctx.pix_fmt);
-        frame.set_width(encode_ctx.width);
-        frame.set_height(encode_ctx.height);
-        frame.alloc_buffer()?;
-
-        let mut input_frame = AVFrame::new();
-        input_frame.set_format(ffi::AV_PIX_FMT_RGB24);
-        input_frame.set_width(width as i32);
-        input_frame.set_height(height as i32);
-        input_frame.alloc_buffer()?;
-
-        let sws_ctx = SwsContext::get_context(
-            width as i32,
-            height as i32,
-            ffi::AV_PIX_FMT_RGB24,
-            width as i32,
-            height as i32,
-            ffi::AV_PIX_FMT_YUV420P,
-            ffi::SWS_BILINEAR,
-            None,
-            None,
-            None,
-        )
-        .ok_or(Error::SwsContextCreation)?;
-
         Ok(Self {
-            encode_ctx,
-            output_ctx,
-            frame,
-            input_frame,
-            sws_ctx,
-            stream_index,
+            backend,
             received_frames: BTreeMap::new(),
             next_expected: begin_t,
             width,
@@ -210,70 +307,80 @@ impl FrameEncoder {
                 )));
             }
 
-            let linesize = self.input_frame.linesize_mut()[0] as usize;
-            let width_bytes = (self.width * 3) as usize;
-            let input_data = self.input_frame.data_mut()[0];
+            match &mut self.backend {
+                #[cfg(feature = "embedded-ffmpeg")]
+                EncoderBackend::Rsmpeg(data) => {
+                    let linesize = data.input_frame.linesize_mut()[0] as usize;
+                    let width_bytes = (self.width * 3) as usize;
+                    let input_data = data.input_frame.data_mut()[0];
 
-            // SAFETY:
-            // 1. We checked that raw_frame.len() is exactly width * height * 3.
-            // 2. input_frame is allocated by FFmpeg with correct dimensions (width, height) and RGB24 format.
-            // 3. linesize is guaranteed by FFmpeg to be at least width_bytes.
-            // 4. We copy row by row to handle potential padding in input_frame.
-            unsafe {
-                for i in 0..self.height as usize {
-                    std::ptr::copy_nonoverlapping(
-                        raw_frame.as_ptr().add(i * width_bytes),
-                        input_data.add(i * linesize),
-                        width_bytes,
-                    );
-                }
-            }
-
-            self.frame.make_writable()?;
-
-            // SAFETY:
-            // 1. sws_ctx is created with correct dimensions and formats.
-            // 2. input_frame and self.frame are valid AVFrames allocated by FFmpeg.
-            // 3. Pointers passed to sws_scale are valid data pointers from these frames.
-            unsafe {
-                self.sws_ctx.scale(
-                    self.input_frame.data_mut().as_ptr() as *const *const u8,
-                    self.input_frame.linesize_mut().as_ptr() as *const i32,
-                    0,
-                    self.height as i32,
-                    self.frame.data_mut().as_ptr() as *const *mut u8,
-                    self.frame.linesize_mut().as_ptr() as *const i32,
-                )?;
-            }
-
-            self.frame
-                .set_pts((self.next_expected - self.video_begin_t) as i64);
-
-            #[cfg(feature = "tracy")]
-            let _encode_span =
-                tracing::debug_span!("encode_frame", frame_num = self.next_expected).entered();
-
-            self.encode_ctx.send_frame(Some(&self.frame))?;
-
-            loop {
-                let mut packet = match self.encode_ctx.receive_packet() {
-                    Ok(packet) => packet,
-                    Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => {
-                        break;
+                    unsafe {
+                        for i in 0..self.height as usize {
+                            std::ptr::copy_nonoverlapping(
+                                raw_frame.as_ptr().add(i * width_bytes),
+                                input_data.add(i * linesize),
+                                width_bytes,
+                            );
+                        }
                     }
-                    Err(e) => return Err(e.into()),
-                };
 
-                packet.rescale_ts(
-                    self.encode_ctx.time_base,
-                    self.output_ctx
-                        .streams()
-                        .get(self.stream_index)
-                        .unwrap()
-                        .time_base,
-                );
-                packet.set_stream_index(self.stream_index as i32);
-                self.output_ctx.interleaved_write_frame(&mut packet)?;
+                    data.frame.make_writable()?;
+
+                    unsafe {
+                        data.sws_ctx.scale(
+                            data.input_frame.data_mut().as_ptr() as *const *const u8,
+                            data.input_frame.linesize_mut().as_ptr() as *const i32,
+                            0,
+                            self.height as i32,
+                            data.frame.data_mut().as_ptr() as *const *mut u8,
+                            data.frame.linesize_mut().as_ptr() as *const i32,
+                        )?;
+                    }
+
+                    data.frame
+                        .set_pts((self.next_expected - self.video_begin_t) as i64);
+
+                    #[cfg(feature = "tracy")]
+                    let _encode_span =
+                        tracing::debug_span!("encode_frame", frame_num = self.next_expected)
+                            .entered();
+
+                    data.encode_ctx.send_frame(Some(&data.frame))?;
+
+                    loop {
+                        let mut packet = match data.encode_ctx.receive_packet() {
+                            Ok(packet) => packet,
+                            Err(RsmpegError::EncoderDrainError)
+                            | Err(RsmpegError::EncoderFlushedError) => {
+                                break;
+                            }
+                            Err(e) => return Err(e.into()),
+                        };
+
+                        packet.rescale_ts(
+                            data.encode_ctx.time_base,
+                            data.output_ctx
+                                .streams()
+                                .get(data.stream_index)
+                                .unwrap()
+                                .time_base,
+                        );
+                        packet.set_stream_index(data.stream_index as i32);
+                        data.output_ctx.interleaved_write_frame(&mut packet)?;
+                    }
+                    #[cfg(feature = "tracy")]
+                    drop(_encode_span);
+                }
+                #[cfg(feature = "ffmpeg-bin")]
+                EncoderBackend::Binary(data) => {
+                    let stdin =
+                        data.process.stdin.as_mut().ok_or_else(|| {
+                            anyhow::anyhow!("Failed to get stdin of ffmpeg process")
+                        })?;
+                    stdin
+                        .write_all(&raw_frame)
+                        .map_err(|e| anyhow::anyhow!("Failed to write to ffmpeg stdin: {}", e))?;
+                }
             }
 
             if !stop_signal.load(Ordering::SeqCst)
@@ -281,8 +388,6 @@ impl FrameEncoder {
             {
                 p.pb_inc(1);
             }
-            #[cfg(feature = "tracy")]
-            drop(_encode_span);
             self.next_expected += 1;
         }
         Ok(())
@@ -302,97 +407,133 @@ impl FrameEncoder {
                 )));
             }
 
-            let linesize = self.input_frame.linesize_mut()[0] as usize;
-            let width_bytes = (self.width * 3) as usize;
-            let input_data = self.input_frame.data_mut()[0];
+            match &mut self.backend {
+                #[cfg(feature = "embedded-ffmpeg")]
+                EncoderBackend::Rsmpeg(data) => {
+                    let linesize = data.input_frame.linesize_mut()[0] as usize;
+                    let width_bytes = (self.width * 3) as usize;
+                    let input_data = data.input_frame.data_mut()[0];
 
-            // SAFETY: See encode_frame method for safety justifications.
-            unsafe {
-                for i in 0..self.height as usize {
-                    std::ptr::copy_nonoverlapping(
-                        raw_frame.as_ptr().add(i * width_bytes),
-                        input_data.add(i * linesize),
-                        width_bytes,
-                    );
-                }
-            }
+                    unsafe {
+                        for i in 0..self.height as usize {
+                            std::ptr::copy_nonoverlapping(
+                                raw_frame.as_ptr().add(i * width_bytes),
+                                input_data.add(i * linesize),
+                                width_bytes,
+                            );
+                        }
+                    }
 
-            self.frame.make_writable()?;
+                    data.frame.make_writable()?;
 
-            // SAFETY: See encode_frame method for safety justifications.
-            unsafe {
-                self.sws_ctx.scale(
-                    self.input_frame.data_mut().as_ptr() as *const *const u8,
-                    self.input_frame.linesize_mut().as_ptr() as *const i32,
-                    0,
-                    self.height as i32,
-                    self.frame.data_mut().as_ptr() as *const *mut u8,
-                    self.frame.linesize_mut().as_ptr() as *const i32,
-                )?;
-            }
+                    unsafe {
+                        data.sws_ctx.scale(
+                            data.input_frame.data_mut().as_ptr() as *const *const u8,
+                            data.input_frame.linesize_mut().as_ptr() as *const i32,
+                            0,
+                            self.height as i32,
+                            data.frame.data_mut().as_ptr() as *const *mut u8,
+                            data.frame.linesize_mut().as_ptr() as *const i32,
+                        )?;
+                    }
 
-            self.frame
-                .set_pts((self.next_expected - self.video_begin_t) as i64);
+                    data.frame
+                        .set_pts((self.next_expected - self.video_begin_t) as i64);
 
-            #[cfg(feature = "tracy")]
-            let _encode_span =
-                tracing::debug_span!("encode_remaining_frame", frame_num = self.next_expected)
+                    #[cfg(feature = "tracy")]
+                    let _encode_span = tracing::debug_span!(
+                        "encode_remaining_frame",
+                        frame_num = self.next_expected
+                    )
                     .entered();
 
-            self.encode_ctx.send_frame(Some(&self.frame))?;
+                    data.encode_ctx.send_frame(Some(&data.frame))?;
 
-            loop {
-                let mut packet = match self.encode_ctx.receive_packet() {
-                    Ok(packet) => packet,
-                    Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => {
-                        break;
+                    loop {
+                        let mut packet = match data.encode_ctx.receive_packet() {
+                            Ok(packet) => packet,
+                            Err(RsmpegError::EncoderDrainError)
+                            | Err(RsmpegError::EncoderFlushedError) => {
+                                break;
+                            }
+                            Err(e) => return Err(e.into()),
+                        };
+
+                        packet.rescale_ts(
+                            data.encode_ctx.time_base,
+                            data.output_ctx
+                                .streams()
+                                .get(data.stream_index)
+                                .unwrap()
+                                .time_base,
+                        );
+                        packet.set_stream_index(data.stream_index as i32);
+                        data.output_ctx.interleaved_write_frame(&mut packet)?;
                     }
-                    Err(e) => return Err(e.into()),
-                };
-
-                packet.rescale_ts(
-                    self.encode_ctx.time_base,
-                    self.output_ctx
-                        .streams()
-                        .get(self.stream_index)
-                        .unwrap()
-                        .time_base,
-                );
-                packet.set_stream_index(self.stream_index as i32);
-                self.output_ctx.interleaved_write_frame(&mut packet)?;
+                    #[cfg(feature = "tracy")]
+                    drop(_encode_span);
+                }
+                #[cfg(feature = "ffmpeg-bin")]
+                EncoderBackend::Binary(data) => {
+                    let stdin =
+                        data.process.stdin.as_mut().ok_or_else(|| {
+                            anyhow::anyhow!("Failed to get stdin of ffmpeg process")
+                        })?;
+                    stdin
+                        .write_all(&raw_frame)
+                        .map_err(|e| anyhow::anyhow!("Failed to write to ffmpeg stdin: {}", e))?;
+                }
             }
 
             if let Some(p) = encode_progress {
                 p.pb_inc(1);
             }
-            #[cfg(feature = "tracy")]
-            drop(_encode_span);
             self.next_expected += 1;
         }
 
-        self.encode_ctx.send_frame(None)?;
-        loop {
-            let mut packet = match self.encode_ctx.receive_packet() {
-                Ok(packet) => packet,
-                Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => {
-                    break;
+        match self.backend {
+            #[cfg(feature = "embedded-ffmpeg")]
+            EncoderBackend::Rsmpeg(mut data) => {
+                data.encode_ctx.send_frame(None)?;
+                loop {
+                    let mut packet = match data.encode_ctx.receive_packet() {
+                        Ok(packet) => packet,
+                        Err(RsmpegError::EncoderDrainError)
+                        | Err(RsmpegError::EncoderFlushedError) => {
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+
+                    packet.rescale_ts(
+                        data.encode_ctx.time_base,
+                        data.output_ctx
+                            .streams()
+                            .get(data.stream_index)
+                            .unwrap()
+                            .time_base,
+                    );
+                    packet.set_stream_index(data.stream_index as i32);
+                    data.output_ctx.interleaved_write_frame(&mut packet)?;
                 }
-                Err(e) => return Err(e.into()),
-            };
 
-            packet.rescale_ts(
-                self.encode_ctx.time_base,
-                self.output_ctx
-                    .streams()
-                    .get(self.stream_index)
-                    .unwrap()
-                    .time_base,
-            );
-            packet.set_stream_index(self.stream_index as i32);
-            self.output_ctx.interleaved_write_frame(&mut packet)?;
+                data.output_ctx.write_trailer()?;
+            }
+            #[cfg(feature = "ffmpeg-bin")]
+            EncoderBackend::Binary(mut data) => {
+                // Drop stdin to signal EOF
+                drop(data.process.stdin.take());
+                let status = data
+                    .process
+                    .wait()
+                    .map_err(|e| anyhow::anyhow!("Failed to wait for ffmpeg process: {}", e))?;
+                if !status.success() {
+                    return Err(
+                        anyhow::anyhow!("ffmpeg process exited with error: {}", status).into(),
+                    );
+                }
+            }
         }
-
-        self.output_ctx.write_trailer()?;
         Ok(())
     }
 }
@@ -536,11 +677,11 @@ impl TypstVideoRenderer {
         encoding_span.pb_set_message("encoding");
 
         let stop_signal = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "embedded-ffmpeg")]
         static FFMPEG_INIT: Once = Once::new();
-        FFMPEG_INIT.call_once(|| {
-            unsafe {
-                ffi::av_log_set_level(ffi::AV_LOG_ERROR as i32);
-            }
+        #[cfg(feature = "embedded-ffmpeg")]
+        FFMPEG_INIT.call_once(|| unsafe {
+            ffi::av_log_set_level(ffi::AV_LOG_ERROR as i32);
         });
 
         Ok((rendering_span, encoding_span, stop_signal))
@@ -628,6 +769,7 @@ impl TypstVideoRenderer {
 
             let ffmpeg_options = self.config.ffmpeg_options.clone();
             let zstd_level = self.config.zstd_level;
+            let ffmpeg_path = self.config.ffmpeg_path.clone();
             let stop_signal1 = stop_signal.clone();
             let error_signal1 = error_signal.clone();
             let encoding_span = encoding_span.clone();
@@ -647,6 +789,7 @@ impl TypstVideoRenderer {
                         Some(encoding_span),
                         ffmpeg_options,
                         zstd_level,
+                        ffmpeg_path,
                         stop_signal1,
                         error_signal1,
                     )
@@ -788,8 +931,12 @@ impl TypstVideoRenderer {
             .map(|p| p.path().to_str().unwrap())
             .collect();
 
-        merge_mp4_files(&input_paths_str, &final_output_path)
-            .map_err(|e| Error::MergeVideoChunks(e.to_string()))?;
+        merge_mp4_files(
+            &input_paths_str,
+            &final_output_path,
+            self.config.ffmpeg_path.as_deref(),
+        )
+        .map_err(|e| Error::MergeVideoChunks(e.to_string()))?;
 
         let mut buf = Vec::new();
         output_file.read_to_end(&mut buf)?;
@@ -809,6 +956,7 @@ impl TypstVideoRenderer {
         encode_progress: Option<Span>,
         ffmpeg_options: HashMap<String, String>,
         zstd_level: Option<i32>,
+        ffmpeg_path: Option<String>,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
     ) -> Result<()> {
@@ -821,6 +969,7 @@ impl TypstVideoRenderer {
             video_begin_t,
             ffmpeg_options,
             zstd_level,
+            ffmpeg_path,
         )?;
 
         for (frame_num, frame) in rx {

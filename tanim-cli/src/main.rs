@@ -34,6 +34,10 @@ pub struct Args {
     /// Zstd compression level for frames before sending to encoder
     #[clap(long)]
     pub zstd_level: Option<i32>,
+    #[cfg(feature = "ffmpeg-bin")]
+    /// Path to ffmpeg binary
+    #[clap(long)]
+    pub ffmpeg_path: Option<String>,
 }
 
 fn parse_range(s: &str) -> Result<std::ops::RangeInclusive<i32>, String> {
@@ -113,6 +117,7 @@ fn main() -> anyhow::Result<()> {
         rendering_threads: args.rendering_threads,
         encoding_threads: args.encoding_threads,
         zstd_level: args.zstd_level,
+        ffmpeg_path: args.ffmpeg_path,
     };
 
     let renderer = TypstVideoRenderer::new(config);
