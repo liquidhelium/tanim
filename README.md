@@ -8,7 +8,7 @@ Tanim CLI is a command-line tool for creating animations and videos using [Typst
 
 ## Features
 
-*   Render Typst documents to video.
+*   Render Typst documents to video. Both embedded typst and typst executable are supported
 *   Customize frame range, resolution (PPI), and video encoder options.
 *   Pass a variable to your Typst file that changes with each frame.
 
@@ -18,6 +18,21 @@ You can install Tanim CLI using `cargo`:
 
 ```bash
 cargo install tanim-cli
+```
+
+The following features are available for installation:
+
+*   `embedded-ffmpeg`: Embeds FFmpeg functionality via the `rsmpeg` crate.
+*   `ffmpeg-bin`: Uses an external FFmpeg binary for video encoding.
+*   `typst-lib`: Uses statically linked typst.
+*   `typst-bin`: Uses an external Typst binary for rendering.
+
+The default feature includes all of the above. If --typst-command or --ffmpeg-command is provided, tanim will use the specified executable. If the library-based features (embedded-ffmpeg or typst-lib) are disabled and no explicit path is provided via CLI, tanim will default to searching for ffmpeg or typst in your system PATH.
+
+You can specify features during installation like this:
+
+```bash
+cargo install tanim-cli --no-default-features --features embedded-ffmpeg,typst-lib
 ```
 
 ## Usage
