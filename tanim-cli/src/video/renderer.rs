@@ -21,7 +21,7 @@ use typst_render::render;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avformat::AVFormatContextOutput,
-    avutil::{AVFrame, AVRational},
+    avutil::{AVDictionary, AVFrame, AVRational},
     error::RsmpegError,
     ffi,
     swscale::SwsContext,
@@ -75,7 +75,7 @@ struct FrameEncoder {
     next_expected: i32,
     width: u32,
     height: u32,
-    fps: u32,
+    _fps: u32,
     video_begin_t: i32,
     zstd_level: Option<i32>,
 }
@@ -108,15 +108,21 @@ impl FrameEncoder {
         encode_ctx.set_framerate(AVRational { num: fps as i32, den: 1 });
         encode_ctx.set_pix_fmt(ffi::AV_PIX_FMT_YUV420P);
 
-        // if !ffmpeg_options.is_empty() {
-        //     // TODO: Set options
-        // }
+        let mut options_dict: Option<AVDictionary> = None;
+        for (k, v) in ffmpeg_options {
+            let k = CString::new(k).unwrap();
+            let v = CString::new(v).unwrap();
+            options_dict = match options_dict {
+                Some(dict) => Some(dict.set(&k, &v, 0)),
+                None => Some(AVDictionary::new(&k, &v, 0)),
+            };
+        }
 
         if output_ctx.oformat().flags & ffi::AVFMT_GLOBALHEADER as i32 != 0 {
             encode_ctx.set_flags(encode_ctx.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
         }
 
-        encode_ctx.open(None)?;
+        encode_ctx.open(options_dict)?;
 
         let stream_index = {
             let mut stream = output_ctx.new_stream();
@@ -164,7 +170,7 @@ impl FrameEncoder {
             next_expected: begin_t,
             width,
             height,
-            fps,
+            _fps: fps,
             video_begin_t,
             zstd_level,
         })

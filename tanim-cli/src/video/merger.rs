@@ -1,6 +1,5 @@
 use crate::video::error::Result;
 use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput};
-use rsmpeg::ffi;
 use std::ffi::CString;
 
 pub fn merge_mp4_files(input_files: &Vec<&str>, output_file: &str) -> Result<String> {
