@@ -1,7 +1,7 @@
-use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
-use clap::{builder::ValueParser, Parser};
-use tanim_cli::video::{config::RenderConfig, TypstVideoRenderer};
+use clap::{Parser, builder::ValueParser};
+use tanim_cli::video::{TypstVideoRenderer, config::RenderConfig};
 use tinymist_world::{args::CompileOnceArgs, print_diagnostics};
 use tracing::{error, info};
 use tracing_indicatif::IndicatifLayer;
@@ -128,7 +128,7 @@ fn main() -> anyhow::Result<()> {
         Ok(data) => data,
         Err(e) => {
             if let tanim_cli::video::error::Error::TypstCompilation(diags) = &e {
-                if let Err(e) =  print_diagnostics(
+                if let Err(e) = print_diagnostics(
                     &world,
                     diags.iter(),
                     tinymist_world::DiagnosticFormat::Human,

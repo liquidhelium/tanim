@@ -1,6 +1,15 @@
 use crossbeam::channel;
 use indicatif::ProgressStyle;
 use ndarray::Array3;
+use rsmpeg::{
+    avcodec::{AVCodec, AVCodecContext},
+    avformat::AVFormatContextOutput,
+    avutil::{AVDictionary, AVFrame, AVRational},
+    error::RsmpegError,
+    ffi,
+    swscale::SwsContext,
+};
+use std::ffi::CString;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
@@ -18,15 +27,6 @@ use tracing::{debug_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use typst::{diag::Warned, layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
-use rsmpeg::{
-    avcodec::{AVCodec, AVCodecContext},
-    avformat::AVFormatContextOutput,
-    avutil::{AVDictionary, AVFrame, AVRational},
-    error::RsmpegError,
-    ffi,
-    swscale::SwsContext,
-};
-use std::ffi::CString;
 
 use super::{
     config::RenderConfig,
@@ -97,15 +97,23 @@ impl FrameEncoder {
         let output_file_cstr = CString::new(output_path).unwrap();
         let mut output_ctx = AVFormatContextOutput::create(output_file_cstr.as_c_str(), None)?;
 
-        let codec = AVCodec::find_encoder_by_name(std::ffi::CStr::from_bytes_with_nul(b"libx264\0").unwrap())
-            .or_else(|| AVCodec::find_encoder(ffi::AV_CODEC_ID_H264))
-            .expect("H.264 encoder not found");
+        let codec = AVCodec::find_encoder_by_name(
+            std::ffi::CStr::from_bytes_with_nul(b"libx264\0").unwrap(),
+        )
+        .or_else(|| AVCodec::find_encoder(ffi::AV_CODEC_ID_H264))
+        .expect("H.264 encoder not found");
 
         let mut encode_ctx = AVCodecContext::new(&codec);
         encode_ctx.set_height(height as i32);
         encode_ctx.set_width(width as i32);
-        encode_ctx.set_time_base(AVRational { num: 1, den: fps as i32 });
-        encode_ctx.set_framerate(AVRational { num: fps as i32, den: 1 });
+        encode_ctx.set_time_base(AVRational {
+            num: 1,
+            den: fps as i32,
+        });
+        encode_ctx.set_framerate(AVRational {
+            num: fps as i32,
+            den: 1,
+        });
         encode_ctx.set_pix_fmt(ffi::AV_PIX_FMT_YUV420P);
 
         let mut options_dict: Option<AVDictionary> = None;
@@ -157,7 +165,8 @@ impl FrameEncoder {
             None,
             None,
             None,
-        ).ok_or(Error::SwsContextCreation)?;
+        )
+        .ok_or(Error::SwsContextCreation)?;
 
         Ok(Self {
             encode_ctx,
@@ -195,49 +204,50 @@ impl FrameEncoder {
             } else {
                 received_frame
             };
-if raw_frame.len() != (self.width * self.height * 3) as usize {
-    return Err(Error::NDArrayShape(ndarray::ShapeError::from_kind(
-        ndarray::ErrorKind::IncompatibleShape,
-    )));
-}
+            if raw_frame.len() != (self.width * self.height * 3) as usize {
+                return Err(Error::NDArrayShape(ndarray::ShapeError::from_kind(
+                    ndarray::ErrorKind::IncompatibleShape,
+                )));
+            }
 
-let linesize = self.input_frame.linesize_mut()[0] as usize;
-let width_bytes = (self.width * 3) as usize;
-let input_data = self.input_frame.data_mut()[0];
+            let linesize = self.input_frame.linesize_mut()[0] as usize;
+            let width_bytes = (self.width * 3) as usize;
+            let input_data = self.input_frame.data_mut()[0];
 
-// SAFETY:
-// 1. We checked that raw_frame.len() is exactly width * height * 3.
-// 2. input_frame is allocated by FFmpeg with correct dimensions (width, height) and RGB24 format.
-// 3. linesize is guaranteed by FFmpeg to be at least width_bytes.
-// 4. We copy row by row to handle potential padding in input_frame.
-unsafe {
-    for i in 0..self.height as usize {
-        std::ptr::copy_nonoverlapping(
-            raw_frame.as_ptr().add(i * width_bytes),
-            input_data.add(i * linesize),
-            width_bytes,
-        );
-    }
-}
+            // SAFETY:
+            // 1. We checked that raw_frame.len() is exactly width * height * 3.
+            // 2. input_frame is allocated by FFmpeg with correct dimensions (width, height) and RGB24 format.
+            // 3. linesize is guaranteed by FFmpeg to be at least width_bytes.
+            // 4. We copy row by row to handle potential padding in input_frame.
+            unsafe {
+                for i in 0..self.height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        raw_frame.as_ptr().add(i * width_bytes),
+                        input_data.add(i * linesize),
+                        width_bytes,
+                    );
+                }
+            }
 
-self.frame.make_writable()?;
+            self.frame.make_writable()?;
 
-// SAFETY:
-// 1. sws_ctx is created with correct dimensions and formats.
-// 2. input_frame and self.frame are valid AVFrames allocated by FFmpeg.
-// 3. Pointers passed to sws_scale are valid data pointers from these frames.
-unsafe {
-    self.sws_ctx.scale(
-        self.input_frame.data_mut().as_ptr() as *const *const u8,
-        self.input_frame.linesize_mut().as_ptr() as *const i32,
-        0,
-        self.height as i32,
-        self.frame.data_mut().as_ptr() as *const *mut u8,
-        self.frame.linesize_mut().as_ptr() as *const i32,
-    )?;
-}
+            // SAFETY:
+            // 1. sws_ctx is created with correct dimensions and formats.
+            // 2. input_frame and self.frame are valid AVFrames allocated by FFmpeg.
+            // 3. Pointers passed to sws_scale are valid data pointers from these frames.
+            unsafe {
+                self.sws_ctx.scale(
+                    self.input_frame.data_mut().as_ptr() as *const *const u8,
+                    self.input_frame.linesize_mut().as_ptr() as *const i32,
+                    0,
+                    self.height as i32,
+                    self.frame.data_mut().as_ptr() as *const *mut u8,
+                    self.frame.linesize_mut().as_ptr() as *const i32,
+                )?;
+            }
 
-            self.frame.set_pts((self.next_expected - self.video_begin_t) as i64);
+            self.frame
+                .set_pts((self.next_expected - self.video_begin_t) as i64);
 
             #[cfg(feature = "tracy")]
             let _encode_span =
@@ -248,11 +258,20 @@ unsafe {
             loop {
                 let mut packet = match self.encode_ctx.receive_packet() {
                     Ok(packet) => packet,
-                    Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => break,
+                    Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => {
+                        break;
+                    }
                     Err(e) => return Err(e.into()),
                 };
 
-                packet.rescale_ts(self.encode_ctx.time_base, self.output_ctx.streams().get(self.stream_index).unwrap().time_base);
+                packet.rescale_ts(
+                    self.encode_ctx.time_base,
+                    self.output_ctx
+                        .streams()
+                        .get(self.stream_index)
+                        .unwrap()
+                        .time_base,
+                );
                 packet.set_stream_index(self.stream_index as i32);
                 self.output_ctx.interleaved_write_frame(&mut packet)?;
             }
@@ -277,42 +296,43 @@ unsafe {
             } else {
                 received_frame
             };
-if raw_frame.len() != (self.width * self.height * 3) as usize {
-    return Err(Error::NDArrayShape(ndarray::ShapeError::from_kind(
-        ndarray::ErrorKind::IncompatibleShape,
-    )));
-}
+            if raw_frame.len() != (self.width * self.height * 3) as usize {
+                return Err(Error::NDArrayShape(ndarray::ShapeError::from_kind(
+                    ndarray::ErrorKind::IncompatibleShape,
+                )));
+            }
 
-let linesize = self.input_frame.linesize_mut()[0] as usize;
-let width_bytes = (self.width * 3) as usize;
-let input_data = self.input_frame.data_mut()[0];
+            let linesize = self.input_frame.linesize_mut()[0] as usize;
+            let width_bytes = (self.width * 3) as usize;
+            let input_data = self.input_frame.data_mut()[0];
 
-// SAFETY: See encode_frame method for safety justifications.
-unsafe {
-    for i in 0..self.height as usize {
-        std::ptr::copy_nonoverlapping(
-            raw_frame.as_ptr().add(i * width_bytes),
-            input_data.add(i * linesize),
-            width_bytes,
-        );
-    }
-}
+            // SAFETY: See encode_frame method for safety justifications.
+            unsafe {
+                for i in 0..self.height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        raw_frame.as_ptr().add(i * width_bytes),
+                        input_data.add(i * linesize),
+                        width_bytes,
+                    );
+                }
+            }
 
-self.frame.make_writable()?;
+            self.frame.make_writable()?;
 
-// SAFETY: See encode_frame method for safety justifications.
-unsafe {
-    self.sws_ctx.scale(
-        self.input_frame.data_mut().as_ptr() as *const *const u8,
-        self.input_frame.linesize_mut().as_ptr() as *const i32,
-        0,
-        self.height as i32,
-        self.frame.data_mut().as_ptr() as *const *mut u8,
-        self.frame.linesize_mut().as_ptr() as *const i32,
-    )?;
-}
+            // SAFETY: See encode_frame method for safety justifications.
+            unsafe {
+                self.sws_ctx.scale(
+                    self.input_frame.data_mut().as_ptr() as *const *const u8,
+                    self.input_frame.linesize_mut().as_ptr() as *const i32,
+                    0,
+                    self.height as i32,
+                    self.frame.data_mut().as_ptr() as *const *mut u8,
+                    self.frame.linesize_mut().as_ptr() as *const i32,
+                )?;
+            }
 
-            self.frame.set_pts((self.next_expected - self.video_begin_t) as i64);
+            self.frame
+                .set_pts((self.next_expected - self.video_begin_t) as i64);
 
             #[cfg(feature = "tracy")]
             let _encode_span =
@@ -325,7 +345,7 @@ unsafe {
                 let mut packet = match self.encode_ctx.receive_packet() {
                     Ok(packet) => packet,
                     Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => {
-                        break
+                        break;
                     }
                     Err(e) => return Err(e.into()),
                 };
@@ -355,7 +375,7 @@ unsafe {
             let mut packet = match self.encode_ctx.receive_packet() {
                 Ok(packet) => packet,
                 Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => {
-                    break
+                    break;
                 }
                 Err(e) => return Err(e.into()),
             };

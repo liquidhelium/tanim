@@ -4,7 +4,8 @@ use once_cell::sync::Lazy;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering}, LockResult, Mutex
+        LockResult, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     thread::{self, ThreadId},
 };
@@ -53,8 +54,7 @@ pub struct LockInfo {
 /// The global state of all threads and locks.
 static GLOBAL_STATE: Lazy<Mutex<HashMap<ThreadId, ThreadState>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static LOCK_INFO: Lazy<Mutex<HashMap<LockId, LockInfo>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static LOCK_INFO: Lazy<Mutex<HashMap<LockId, LockInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// A counter for generating unique lock IDs.
 static NEXT_LOCK_ID: AtomicUsize = AtomicUsize::new(0);
@@ -62,10 +62,12 @@ static NEXT_LOCK_ID: AtomicUsize = AtomicUsize::new(0);
 /// Generates a new unique lock ID.
 pub fn new_lock_id(name: &str) -> LockId {
     let id = NEXT_LOCK_ID.fetch_add(1, Ordering::SeqCst);
-    LOCK_INFO
-        .lock()
-        .unwrap()
-        .insert(id, LockInfo { name: name.to_string() });
+    LOCK_INFO.lock().unwrap().insert(
+        id,
+        LockInfo {
+            name: name.to_string(),
+        },
+    );
     id
 }
 /// A wrapper around `std::sync::Mutex` that tracks its state.
@@ -87,7 +89,9 @@ impl<T> DebugMutex<T> {
     }
 
     /// Acquires the lock, blocking the current thread until it is able to do so.
-    pub fn lock(&self) -> Result<DebugMutexGuard<'_, T>, std::sync::PoisonError<std::sync::MutexGuard<'_, T>>> {
+    pub fn lock(
+        &self,
+    ) -> Result<DebugMutexGuard<'_, T>, std::sync::PoisonError<std::sync::MutexGuard<'_, T>>> {
         let thread_id = thread::current().id();
 
         // Mark the thread as waiting for the lock.
@@ -110,7 +114,10 @@ impl<T> DebugMutex<T> {
             .locks
             .insert(self.id, LockState::Held);
 
-        guard.map(|g| DebugMutexGuard { mutex: self, guard: g })
+        guard.map(|g| DebugMutexGuard {
+            mutex: self,
+            guard: g,
+        })
     }
 }
 
@@ -173,10 +180,7 @@ pub fn dump_deadlock_info() {
     let state = GLOBAL_STATE.lock().unwrap();
     let lock_info = LOCK_INFO.lock().unwrap();
     for (thread_id, thread_state) in state.iter() {
-        info!(
-            "Thread ID: {:?}, Name: {}",
-            thread_id, thread_state.name
-        );
+        info!("Thread ID: {:?}, Name: {}", thread_id, thread_state.name);
         if !thread_state.locks.is_empty() {
             for (lock_id, lock_state) in thread_state.locks.iter() {
                 let state_str = match lock_state {

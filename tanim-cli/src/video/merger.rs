@@ -10,7 +10,8 @@ pub fn merge_mp4_files(input_files: &Vec<&str>, output_file: &str) -> Result<Str
 
     for input_file in input_files {
         let input_file_cstr = CString::new(*input_file).unwrap();
-        let mut input_ctx = AVFormatContextInput::open(input_file_cstr.as_c_str(), None, &mut None)?;
+        let mut input_ctx =
+            AVFormatContextInput::open(input_file_cstr.as_c_str(), None, &mut None)?;
         input_ctx.dump(0, input_file_cstr.as_c_str())?;
 
         // Initialize output streams based on the first input file
