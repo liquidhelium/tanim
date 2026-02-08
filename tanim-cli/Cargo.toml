@@ -1,6 +1,6 @@
 [package]
 name = "tanim-cli"
-version = "0.13.2"
+version = "0.14.2"
 edition = "2024"
 description = "Render typst files to video in command line"
 authors = ["liquidhelium <liquidhelium@163.com>"]
