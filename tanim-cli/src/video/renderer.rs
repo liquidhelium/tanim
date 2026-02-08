@@ -13,10 +13,12 @@ use rsmpeg::{
 #[cfg(feature = "embedded-ffmpeg")]
 use std::ffi::CString;
 
-#[cfg(feature = "ffmpeg-bin")]
+#[cfg(any(feature = "ffmpeg-bin", feature = "typst-bin"))]
 use std::io::Write;
 #[cfg(feature = "ffmpeg-bin")]
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+#[cfg(any(feature = "ffmpeg-bin", feature = "typst-bin"))]
+use std::process::{Command, Stdio};
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
@@ -27,12 +29,15 @@ use std::{
     thread,
 };
 use tiny_skia::Pixmap;
+#[cfg(feature = "typst-lib")]
 use tinymist_world::print_diagnostics;
 use tracing::{Span, error, info, info_span};
 #[cfg(feature = "tracy")]
 use tracing::{debug_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
+#[cfg(feature = "typst-lib")]
 use typst::{diag::Warned, layout::PagedDocument, utils::LazyHash};
+#[cfg(feature = "typst-lib")]
 use typst_render::render;
 
 use super::{
@@ -560,34 +565,109 @@ impl TypstVideoRenderer {
 
     #[cfg_attr(feature = "tracy", instrument(level = "trace", skip(self)))]
     fn render_frame(&self, t: i32) -> Result<tiny_skia::Pixmap> {
-        let mut universe = self.config.universe.lock().unwrap();
-        universe.increment_revision(|univ| {
-            univ.set_inputs(Arc::new(LazyHash::new((self.config.f_input)(t))));
-        });
-        let world = universe.snapshot();
-        universe.evict(10);
-        typst::comemo::evict(10);
-        drop(universe); // release the lock as soon as possible
-        #[cfg(feature = "tracy")]
-        let _span = debug_span!("compilation", frame = t).entered();
-        let Warned { output, warnings } = typst::compile(&world);
-        #[cfg(feature = "tracy")]
-        drop(_span);
-        let doc: PagedDocument = {
-            if let Err(e) = print_diagnostics(
-                &world,
-                warnings.iter(),
-                tinymist_world::DiagnosticFormat::Human,
-            ) {
-                error!("Error printing diagnostics: {e}");
-            };
-            output.map_err(Error::TypstCompilation)?
-        };
+        #[cfg(feature = "typst-bin")]
+        if let Some(command) = &self.config.typst_command {
+            return self.render_frame_bin(t, command);
+        }
 
-        let frame = doc.pages.first().ok_or(Error::NoPages)?;
-        let pixmap = render(frame, self.config.ppi / 72.0);
-        // It's okay to ignore the result here, as we don't care if the size was already set.
-        // divide by 2 and multiply by 2 to ensure even dimensions, which is required by many video codecs.
+        #[cfg(feature = "typst-lib")]
+        {
+            let mut universe = {
+                #[cfg(feature = "typst-bin")]
+                {
+                    self.config.universe.as_ref().unwrap().lock().unwrap()
+                }
+                #[cfg(not(feature = "typst-bin"))]
+                {
+                    self.config.universe.lock().unwrap()
+                }
+            };
+            universe.increment_revision(|univ| {
+                let input_func = &self.config.f_input;
+                univ.set_inputs(Arc::new(LazyHash::new(input_func(t))));
+            });
+            let world = universe.snapshot();
+            universe.evict(10);
+            typst::comemo::evict(10);
+            drop(universe); // release the lock as soon as possible
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("compilation", frame = t).entered();
+            let Warned { output, warnings } = typst::compile(&world);
+            #[cfg(feature = "tracy")]
+            drop(_span);
+            let doc: PagedDocument = {
+                if let Err(e) = print_diagnostics(
+                    &world,
+                    warnings.iter(),
+                    tinymist_world::DiagnosticFormat::Human,
+                ) {
+                    error!("Error printing diagnostics: {e}");
+                };
+                output.map_err(Error::TypstCompilation)?
+            };
+
+            let frame = doc.pages.first().ok_or(Error::NoPages)?;
+            let pixmap = render(frame, self.config.ppi / 72.0);
+            // It's okay to ignore the result here, as we don't care if the size was already set.
+            // divide by 2 and multiply by 2 to ensure even dimensions, which is required by many video codecs.
+            let _ = self.size.set((
+                pixmap.width() as u32 / 2 * 2,
+                pixmap.height() as u32 / 2 * 2,
+            ));
+            Ok(pixmap)
+        }
+        #[cfg(not(feature = "typst-lib"))]
+        {
+            unreachable!("Typst library feature is disabled, but no binary command was provided")
+        }
+    }
+
+    #[cfg(feature = "typst-bin")]
+    fn render_frame_bin(&self, t: i32, command: &str) -> Result<tiny_skia::Pixmap> {
+        let mut child = Command::new(command)
+            .args([
+                "c",
+                "-",
+                "-",
+                "--format",
+                "png",
+                "--pages",
+                "1",
+                "--ppi",
+                &self.config.ppi.to_string(),
+                "--input",
+                &format!("{}={}", self.config.variable, t),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::TypstBinary(format!("Failed to spawn typst binary: {}", e)))?;
+
+        let input_content = std::fs::read(&self.config.input_path)
+            .map_err(|e| Error::TypstBinary(format!("Failed to read input file: {}", e)))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(&input_content)
+                .map_err(|e| Error::TypstBinary(format!("Failed to write to stdin: {}", e)))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| Error::TypstBinary(format!("Failed to wait for typst binary: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::TypstBinary(format!(
+                "Typst binary failed with status {}: {}",
+                output.status, stderr
+            )));
+        }
+
+        let pixmap = tiny_skia::Pixmap::decode_png(&output.stdout)
+            .map_err(|e| Error::TypstBinary(format!("Failed to decode PNG: {}", e)))?;
+
         let _ = self.size.set((
             pixmap.width() as u32 / 2 * 2,
             pixmap.height() as u32 / 2 * 2,

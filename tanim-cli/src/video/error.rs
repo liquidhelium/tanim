@@ -1,10 +1,16 @@
 use thiserror::Error;
+#[cfg(feature = "typst-lib")]
 use typst::{diag::SourceDiagnostic, ecow::EcoVec};
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[cfg(feature = "typst-lib")]
     #[error("Typst compilation failed: {0:?}")]
     TypstCompilation(EcoVec<SourceDiagnostic>),
+
+    #[cfg(feature = "typst-bin")]
+    #[error("Typst binary compilation failed: {0}")]
+    TypstBinary(String),
 
     #[error("No pages in the document")]
     NoPages,

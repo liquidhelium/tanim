@@ -7,9 +7,9 @@ authors = ["liquidhelium <liquidhelium@163.com>"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-typst = {workspace = true}
-typst-render = {workspace = true}
-tinymist-world = {workspace = true}
+typst = {workspace = true, optional = true}
+typst-render = {workspace = true, optional = true}
+tinymist-world = {workspace = true, optional = true}
 rsmpeg = {workspace = true, features = ["link_system_ffmpeg"], optional = true}
 crossbeam = "0.8.4"
 tiny-skia = "0.11.4"
@@ -28,8 +28,10 @@ zstd = "0.13.1"
 once_cell = "1.21.3"
 
 [features]
-default = ["embedded-ffmpeg", "ffmpeg-bin"]
+default = ["embedded-ffmpeg", "ffmpeg-bin", "typst-lib", "typst-bin"]
 embedded-ffmpeg = ["dep:rsmpeg"]
 ffmpeg-bin = []
+typst-lib = ["dep:typst", "dep:typst-render", "dep:tinymist-world"]
+typst-bin = []
 tracy = ["dep:tracing-tracy"]
 debug = []

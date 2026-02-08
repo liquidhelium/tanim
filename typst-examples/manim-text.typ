@@ -1,6 +1,6 @@
 // author: ParaN3xus (https://github.com/ParaN3xus)
 
-#let t = sys.inputs.at("t", default: 300)
+#let t = int(sys.inputs.at("t", default: 300))
 
 #set page(width: 600pt, height: 300pt)
 #set text(25pt)
