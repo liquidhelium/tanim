@@ -538,8 +538,9 @@ impl TypstVideoRenderer {
         let stop_signal = Arc::new(AtomicBool::new(false));
         static FFMPEG_INIT: Once = Once::new();
         FFMPEG_INIT.call_once(|| {
-            // video_rs::init().unwrap();
-            // video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Error);
+            unsafe {
+                ffi::av_log_set_level(ffi::AV_LOG_ERROR as i32);
+            }
         });
 
         Ok((rendering_span, encoding_span, stop_signal))
