@@ -4,7 +4,6 @@ use ndarray::Array3;
 use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
-    path::PathBuf,
     sync::{
         Arc, Once, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -19,7 +18,15 @@ use tracing::{debug_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use typst::{diag::Warned, layout::PagedDocument, utils::LazyHash};
 use typst_render::render;
-use video_rs::{Encoder, Location, Time};
+use rsmpeg::{
+    avcodec::{AVCodec, AVCodecContext},
+    avformat::AVFormatContextOutput,
+    avutil::{AVFrame, AVRational},
+    error::RsmpegError,
+    ffi,
+    swscale::SwsContext,
+};
+use std::ffi::CString;
 
 use super::{
     config::RenderConfig,
@@ -58,7 +65,12 @@ impl FrameDispatcher {
 }
 
 struct FrameEncoder {
-    encoder: Encoder,
+    encode_ctx: AVCodecContext,
+    output_ctx: AVFormatContextOutput,
+    frame: AVFrame,
+    input_frame: AVFrame,
+    sws_ctx: SwsContext,
+    stream_index: usize,
     received_frames: BTreeMap<i32, Vec<u8>>,
     next_expected: i32,
     width: u32,
@@ -81,15 +93,73 @@ impl FrameEncoder {
         zstd_level: Option<i32>,
     ) -> Result<Self> {
         info!("using ffmpeg options: {ffmpeg_options:?}");
-        let settings = video_rs::encode::Settings::preset_h264_custom(
-            width as usize,
-            height as usize,
-            video_rs::ffmpeg::format::Pixel::YUV420P,
-            ffmpeg_options.into(),
-        );
-        let encoder = Encoder::new(Location::File(PathBuf::from(output_path)), settings)?;
+
+        let output_file_cstr = CString::new(output_path).unwrap();
+        let mut output_ctx = AVFormatContextOutput::create(output_file_cstr.as_c_str(), None)?;
+
+        let codec = AVCodec::find_encoder_by_name(std::ffi::CStr::from_bytes_with_nul(b"libx264\0").unwrap())
+            .or_else(|| AVCodec::find_encoder(ffi::AV_CODEC_ID_H264))
+            .expect("H.264 encoder not found");
+
+        let mut encode_ctx = AVCodecContext::new(&codec);
+        encode_ctx.set_height(height as i32);
+        encode_ctx.set_width(width as i32);
+        encode_ctx.set_time_base(AVRational { num: 1, den: fps as i32 });
+        encode_ctx.set_framerate(AVRational { num: fps as i32, den: 1 });
+        encode_ctx.set_pix_fmt(ffi::AV_PIX_FMT_YUV420P);
+
+        // if !ffmpeg_options.is_empty() {
+        //     // TODO: Set options
+        // }
+
+        if output_ctx.oformat().flags & ffi::AVFMT_GLOBALHEADER as i32 != 0 {
+            encode_ctx.set_flags(encode_ctx.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
+        }
+
+        encode_ctx.open(None)?;
+
+        let stream_index = {
+            let mut stream = output_ctx.new_stream();
+            stream.set_codecpar(encode_ctx.extract_codecpar());
+            stream.set_time_base(encode_ctx.time_base);
+            stream.index as usize
+        };
+
+        output_ctx.dump(0, output_file_cstr.as_c_str())?;
+        output_ctx.write_header(&mut None)?;
+
+        let mut frame = AVFrame::new();
+        frame.set_format(encode_ctx.pix_fmt);
+        frame.set_width(encode_ctx.width);
+        frame.set_height(encode_ctx.height);
+        frame.alloc_buffer()?;
+
+        let mut input_frame = AVFrame::new();
+        input_frame.set_format(ffi::AV_PIX_FMT_RGB24);
+        input_frame.set_width(width as i32);
+        input_frame.set_height(height as i32);
+        input_frame.alloc_buffer()?;
+
+        let sws_ctx = SwsContext::get_context(
+            width as i32,
+            height as i32,
+            ffi::AV_PIX_FMT_RGB24,
+            width as i32,
+            height as i32,
+            ffi::AV_PIX_FMT_YUV420P,
+            ffi::SWS_BILINEAR,
+            None,
+            None,
+            None,
+        ).ok_or(Error::SwsContextCreation)?;
+
         Ok(Self {
-            encoder,
+            encode_ctx,
+            output_ctx,
+            frame,
+            input_frame,
+            sws_ctx,
+            stream_index,
             received_frames: BTreeMap::new(),
             next_expected: begin_t,
             width,
@@ -119,14 +189,68 @@ impl FrameEncoder {
             } else {
                 received_frame
             };
-            let frame =
-                Array3::from_shape_vec((self.height as usize, self.width as usize, 3), raw_frame)?;
-            let timestamp =
-                Time::from_secs((self.next_expected - self.video_begin_t) as f32 / self.fps as f32);
+if raw_frame.len() != (self.width * self.height * 3) as usize {
+    return Err(Error::NDArrayShape(ndarray::ShapeError::from_kind(
+        ndarray::ErrorKind::IncompatibleShape,
+    )));
+}
+
+let linesize = self.input_frame.linesize_mut()[0] as usize;
+let width_bytes = (self.width * 3) as usize;
+let input_data = self.input_frame.data_mut()[0];
+
+// SAFETY:
+// 1. We checked that raw_frame.len() is exactly width * height * 3.
+// 2. input_frame is allocated by FFmpeg with correct dimensions (width, height) and RGB24 format.
+// 3. linesize is guaranteed by FFmpeg to be at least width_bytes.
+// 4. We copy row by row to handle potential padding in input_frame.
+unsafe {
+    for i in 0..self.height as usize {
+        std::ptr::copy_nonoverlapping(
+            raw_frame.as_ptr().add(i * width_bytes),
+            input_data.add(i * linesize),
+            width_bytes,
+        );
+    }
+}
+
+self.frame.make_writable()?;
+
+// SAFETY:
+// 1. sws_ctx is created with correct dimensions and formats.
+// 2. input_frame and self.frame are valid AVFrames allocated by FFmpeg.
+// 3. Pointers passed to sws_scale are valid data pointers from these frames.
+unsafe {
+    self.sws_ctx.scale(
+        self.input_frame.data_mut().as_ptr() as *const *const u8,
+        self.input_frame.linesize_mut().as_ptr() as *const i32,
+        0,
+        self.height as i32,
+        self.frame.data_mut().as_ptr() as *const *mut u8,
+        self.frame.linesize_mut().as_ptr() as *const i32,
+    )?;
+}
+
+            self.frame.set_pts((self.next_expected - self.video_begin_t) as i64);
+
             #[cfg(feature = "tracy")]
             let _encode_span =
                 tracing::debug_span!("encode_frame", frame_num = self.next_expected).entered();
-            self.encoder.encode(&frame, timestamp)?;
+
+            self.encode_ctx.send_frame(Some(&self.frame))?;
+
+            loop {
+                let mut packet = match self.encode_ctx.receive_packet() {
+                    Ok(packet) => packet,
+                    Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => break,
+                    Err(e) => return Err(e.into()),
+                };
+
+                packet.rescale_ts(self.encode_ctx.time_base, self.output_ctx.streams().get(self.stream_index).unwrap().time_base);
+                packet.set_stream_index(self.stream_index as i32);
+                self.output_ctx.interleaved_write_frame(&mut packet)?;
+            }
+
             if !stop_signal.load(Ordering::SeqCst)
                 && let Some(p) = encode_progress
             {
@@ -141,16 +265,77 @@ impl FrameEncoder {
 
     fn finish(mut self, encode_progress: Option<&Span>) -> Result<()> {
         // After the channel is closed, process any remaining frames in the map.
-        while let Some(raw_frame) = self.received_frames.remove(&self.next_expected) {
-            let frame =
-                Array3::from_shape_vec((self.height as usize, self.width as usize, 3), raw_frame)?;
-            let timestamp =
-                Time::from_secs((self.next_expected - self.video_begin_t) as f32 / self.fps as f32);
+        while let Some(received_frame) = self.received_frames.remove(&self.next_expected) {
+            let raw_frame = if self.zstd_level.is_some() {
+                zstd::decode_all(&received_frame[..]).unwrap()
+            } else {
+                received_frame
+            };
+if raw_frame.len() != (self.width * self.height * 3) as usize {
+    return Err(Error::NDArrayShape(ndarray::ShapeError::from_kind(
+        ndarray::ErrorKind::IncompatibleShape,
+    )));
+}
+
+let linesize = self.input_frame.linesize_mut()[0] as usize;
+let width_bytes = (self.width * 3) as usize;
+let input_data = self.input_frame.data_mut()[0];
+
+// SAFETY: See encode_frame method for safety justifications.
+unsafe {
+    for i in 0..self.height as usize {
+        std::ptr::copy_nonoverlapping(
+            raw_frame.as_ptr().add(i * width_bytes),
+            input_data.add(i * linesize),
+            width_bytes,
+        );
+    }
+}
+
+self.frame.make_writable()?;
+
+// SAFETY: See encode_frame method for safety justifications.
+unsafe {
+    self.sws_ctx.scale(
+        self.input_frame.data_mut().as_ptr() as *const *const u8,
+        self.input_frame.linesize_mut().as_ptr() as *const i32,
+        0,
+        self.height as i32,
+        self.frame.data_mut().as_ptr() as *const *mut u8,
+        self.frame.linesize_mut().as_ptr() as *const i32,
+    )?;
+}
+
+            self.frame.set_pts((self.next_expected - self.video_begin_t) as i64);
+
             #[cfg(feature = "tracy")]
             let _encode_span =
                 tracing::debug_span!("encode_remaining_frame", frame_num = self.next_expected)
                     .entered();
-            self.encoder.encode(&frame, timestamp)?;
+
+            self.encode_ctx.send_frame(Some(&self.frame))?;
+
+            loop {
+                let mut packet = match self.encode_ctx.receive_packet() {
+                    Ok(packet) => packet,
+                    Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => {
+                        break
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+
+                packet.rescale_ts(
+                    self.encode_ctx.time_base,
+                    self.output_ctx
+                        .streams()
+                        .get(self.stream_index)
+                        .unwrap()
+                        .time_base,
+                );
+                packet.set_stream_index(self.stream_index as i32);
+                self.output_ctx.interleaved_write_frame(&mut packet)?;
+            }
+
             if let Some(p) = encode_progress {
                 p.pb_inc(1);
             }
@@ -159,7 +344,29 @@ impl FrameEncoder {
             self.next_expected += 1;
         }
 
-        self.encoder.finish()?;
+        self.encode_ctx.send_frame(None)?;
+        loop {
+            let mut packet = match self.encode_ctx.receive_packet() {
+                Ok(packet) => packet,
+                Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => {
+                    break
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            packet.rescale_ts(
+                self.encode_ctx.time_base,
+                self.output_ctx
+                    .streams()
+                    .get(self.stream_index)
+                    .unwrap()
+                    .time_base,
+            );
+            packet.set_stream_index(self.stream_index as i32);
+            self.output_ctx.interleaved_write_frame(&mut packet)?;
+        }
+
+        self.output_ctx.write_trailer()?;
         Ok(())
     }
 }
@@ -305,8 +512,8 @@ impl TypstVideoRenderer {
         let stop_signal = Arc::new(AtomicBool::new(false));
         static FFMPEG_INIT: Once = Once::new();
         FFMPEG_INIT.call_once(|| {
-            video_rs::init().unwrap();
-            video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Error);
+            // video_rs::init().unwrap();
+            // video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Error);
         });
 
         Ok((rendering_span, encoding_span, stop_signal))

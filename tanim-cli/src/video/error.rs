@@ -13,7 +13,7 @@ pub enum Error {
     NDArrayShape(#[from] ndarray::ShapeError),
 
     #[error("Video encoding failed: {0}")]
-    VideoEncoding(#[from] video_rs::Error),
+    VideoEncoding(#[from] rsmpeg::error::RsmpegError),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -38,6 +38,9 @@ pub enum Error {
 
     #[error("Failed to merge video chunks: {0}")]
     MergeVideoChunks(String),
+
+    #[error("Failed to create sws context")]
+    SwsContextCreation,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

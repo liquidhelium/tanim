@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 typst = {workspace = true}
 typst-render = {workspace = true}
 tinymist-world = {workspace = true}
-video-rs = {workspace = true}
+rsmpeg = {workspace = true, features = ["link_system_ffmpeg"]}
 crossbeam = "0.8.4"
 tiny-skia = "0.11.4"
 tracing = "0.1.41"

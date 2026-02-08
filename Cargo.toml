@@ -6,4 +6,4 @@ resolver = "3"
 typst = "0.13.1"
 typst-render = "0.13.1"
 tinymist-world = {version = "0.13", features = ["system", "fonts"]}
-video-rs = {version = "0.10.4", features = ["ndarray"]}
+rsmpeg = {version = "0.16", features = ["link_system_ffmpeg"]}
