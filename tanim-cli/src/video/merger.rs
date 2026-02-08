@@ -14,7 +14,7 @@ compile_error!("At least one of 'embedded-ffmpeg' or 'ffmpeg-bin' features must 
 pub fn merge_mp4_files(
     input_files: &Vec<&str>,
     output_file: &str,
-    ffmpeg_path: Option<&str>,
+    #[cfg(feature = "ffmpeg-bin")] ffmpeg_path: Option<&str>,
 ) -> Result<String> {
     #[cfg(feature = "ffmpeg-bin")]
     if let Some(path) = ffmpeg_path {
@@ -48,8 +48,7 @@ fn merge_with_rsmpeg(input_files: &Vec<&str>, output_file: &str) -> Result<Strin
 
     for input_file in input_files {
         let input_file_cstr = CString::new(*input_file).unwrap();
-        let mut input_ctx =
-            AVFormatContextInput::open(input_file_cstr.as_c_str())?;
+        let mut input_ctx = AVFormatContextInput::open(input_file_cstr.as_c_str())?;
         input_ctx.dump(0, input_file_cstr.as_c_str())?;
 
         // Initialize output streams based on the first input file
@@ -90,7 +89,10 @@ fn merge_with_binary(
     use std::io::Write;
 
     // Create a temporary file to list inputs for ffmpeg concat demuxer
-    let mut list_file = tempfile::Builder::new().suffix(".txt").tempfile().map_err(|e| anyhow::anyhow!(e))?;
+    let mut list_file = tempfile::Builder::new()
+        .suffix(".txt")
+        .tempfile()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     for file in input_files {
         // Simple escaping for single quotes. Ideally we should do more robust escaping.

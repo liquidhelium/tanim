@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+#[cfg(feature = "typst-lib")]
+use std::sync::Mutex;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use clap::{Parser, builder::ValueParser};
 use tanim_cli::video::{TypstVideoRenderer, config::RenderConfig};
@@ -17,6 +19,9 @@ pub struct Args {
     pub compile_once: CompileOnceArgs,
     #[cfg(not(feature = "typst-lib"))]
     pub input: String,
+    #[cfg(not(feature = "typst-lib"))]
+    #[clap(long, default_value = "150.0")]
+    pub ppi: f32,
     #[cfg(feature = "typst-bin")]
     #[clap(long)]
     pub typst_command: Option<String>,
@@ -28,8 +33,6 @@ pub struct Args {
     pub frames: std::ops::RangeInclusive<i32>,
     #[clap(long, default_value = "24", value_parser = clap::value_parser!(u32).range(1..))]
     pub fps: u32,
-    #[clap(long, default_value = "150.0")]
-    pub ppi: f32,
     /// Number of rendering threads to use (default: number of CPUs - 4, minimum 1)
     #[clap(long = "rthreads")]
     pub rendering_threads: Option<usize>,
@@ -117,9 +120,6 @@ fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| "typst".to_string());
 
-    #[cfg(all(feature = "typst-lib", not(feature = "typst-bin")))]
-    let use_binary = false;
-
     // Resolve input path for binary mode
     #[cfg(feature = "typst-bin")]
     let input_path = {
@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
         map.insert("preset".to_string(), args.encoder.preset.clone());
         map
     };
-
+    #[cfg(feature = "typst-lib")]
     let variable = args.variable.clone();
 
     let config = RenderConfig {
@@ -159,8 +159,15 @@ fn main() -> anyhow::Result<()> {
             None
         },
 
-        ppi: args.ppi,
-
+        ppi: {
+            #[cfg(feature = "typst-lib")]
+            {
+                args.compile_once.png.ppi
+            }
+            #[cfg(all(feature = "typst-bin", not(feature = "typst-lib")))]
+            args.ppi
+        },
+        #[cfg(feature = "typst-lib")]
         f_input: Box::new(move |t| {
             Dict::from_iter([(Str::from(variable.clone()), Value::Int(t.into()))])
         }),
@@ -193,6 +200,7 @@ fn main() -> anyhow::Result<()> {
         rendering_threads: args.rendering_threads,
         encoding_threads: args.encoding_threads,
         zstd_level: args.zstd_level,
+        #[cfg(feature = "ffmpeg-bin")]
         ffmpeg_path: args.ffmpeg_path,
     };
 

@@ -23,7 +23,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::Read,
     sync::{
-        Arc, Once, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -120,7 +120,7 @@ impl FrameEncoder {
         video_begin_t: i32,
         ffmpeg_options: HashMap<String, String>,
         zstd_level: Option<i32>,
-        ffmpeg_path: Option<String>,
+        #[cfg(feature = "ffmpeg-bin")] ffmpeg_path: Option<String>,
     ) -> Result<Self> {
         info!("using ffmpeg options: {ffmpeg_options:?}");
 
@@ -170,8 +170,7 @@ impl FrameEncoder {
             #[cfg(feature = "embedded-ffmpeg")]
             {
                 let output_file_cstr = CString::new(output_path).unwrap();
-                let mut output_ctx =
-                    AVFormatContextOutput::create(output_file_cstr.as_c_str())?;
+                let mut output_ctx = AVFormatContextOutput::create(output_file_cstr.as_c_str())?;
 
                 let codec = ffmpeg_options
                     .get("codec")
@@ -480,6 +479,7 @@ impl FrameEncoder {
                 }
                 #[cfg(feature = "ffmpeg-bin")]
                 EncoderBackend::Binary(data) => {
+                    let _ = self.video_begin_t;
                     let stdin =
                         data.process.stdin.as_mut().ok_or_else(|| {
                             anyhow::anyhow!("Failed to get stdin of ffmpeg process")
@@ -757,6 +757,9 @@ impl TypstVideoRenderer {
         encoding_span.pb_set_message("encoding");
 
         let stop_signal = Arc::new(AtomicBool::new(false));
+
+        #[cfg(feature = "embedded-ffmpeg")]
+        use std::sync::Once;
         #[cfg(feature = "embedded-ffmpeg")]
         static FFMPEG_INIT: Once = Once::new();
         #[cfg(feature = "embedded-ffmpeg")]
@@ -849,6 +852,7 @@ impl TypstVideoRenderer {
 
             let ffmpeg_options = self.config.ffmpeg_options.clone();
             let zstd_level = self.config.zstd_level;
+            #[cfg(feature = "ffmpeg-bin")]
             let ffmpeg_path = self.config.ffmpeg_path.clone();
             let stop_signal1 = stop_signal.clone();
             let error_signal1 = error_signal.clone();
@@ -869,6 +873,7 @@ impl TypstVideoRenderer {
                         Some(encoding_span),
                         ffmpeg_options,
                         zstd_level,
+                        #[cfg(feature = "ffmpeg-bin")]
                         ffmpeg_path,
                         stop_signal1,
                         error_signal1,
@@ -1014,6 +1019,7 @@ impl TypstVideoRenderer {
         merge_mp4_files(
             &input_paths_str,
             &final_output_path,
+            #[cfg(feature = "ffmpeg-bin")]
             self.config.ffmpeg_path.as_deref(),
         )
         .map_err(|e| Error::MergeVideoChunks(e.to_string()))?;
@@ -1036,7 +1042,7 @@ impl TypstVideoRenderer {
         encode_progress: Option<Span>,
         ffmpeg_options: HashMap<String, String>,
         zstd_level: Option<i32>,
-        ffmpeg_path: Option<String>,
+        #[cfg(feature = "ffmpeg-bin")] ffmpeg_path: Option<String>,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
     ) -> Result<()> {
@@ -1049,6 +1055,7 @@ impl TypstVideoRenderer {
             video_begin_t,
             ffmpeg_options,
             zstd_level,
+            #[cfg(feature = "ffmpeg-bin")]
             ffmpeg_path,
         )?;
 

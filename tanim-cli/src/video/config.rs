@@ -1,7 +1,6 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::collections::HashMap;
+#[cfg(feature = "typst-lib")]
+use std::sync::{Arc, Mutex};
 #[cfg(feature = "typst-lib")]
 use tinymist_world::TypstSystemUniverse;
 #[cfg(feature = "typst-lib")]
@@ -17,7 +16,7 @@ pub struct RenderConfig {
     pub universe: Option<Arc<Mutex<TypstSystemUniverse>>>,
 
     pub ppi: f32,
-
+    #[cfg(feature = "typst-lib")]
     pub f_input: Box<dyn Fn(i32) -> Dict + 'static + Send + Sync>,
 
     #[cfg(feature = "typst-bin")]
@@ -34,5 +33,6 @@ pub struct RenderConfig {
     pub rendering_threads: Option<usize>,
     pub encoding_threads: Option<usize>,
     pub zstd_level: Option<i32>,
+    #[cfg(feature = "ffmpeg-bin")]
     pub ffmpeg_path: Option<String>,
 }
