@@ -10,6 +10,10 @@ license = "MIT OR Apache-2.0"
 typst = {workspace = true, optional = true}
 typst-render = {workspace = true, optional = true}
 tinymist-world = {workspace = true, optional = true}
+# HACK: tinymist-world 0.14.6 has misconfigured feature sets.
+# this dependency is added to force cargo to enable those features.
+# TODO: remove this dependency when upstream updated.
+fontdb = {version = "0.23", default-features = false, features = ["fs", "memmap"]}
 rsmpeg = {workspace = true, features = ["link_system_ffmpeg"], optional = true}
 crossbeam = "0.8.4"
 tiny-skia = "0.11.4"

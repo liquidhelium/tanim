@@ -42,14 +42,14 @@ pub fn merge_mp4_files(
 #[cfg(feature = "embedded-ffmpeg")]
 fn merge_with_rsmpeg(input_files: &Vec<&str>, output_file: &str) -> Result<String> {
     let output_file_cstr = CString::new(output_file).unwrap();
-    let mut output_ctx = AVFormatContextOutput::create(output_file_cstr.as_c_str(), None)?;
+    let mut output_ctx = AVFormatContextOutput::create(output_file_cstr.as_c_str())?;
 
     let mut streams_created = false;
 
     for input_file in input_files {
         let input_file_cstr = CString::new(*input_file).unwrap();
         let mut input_ctx =
-            AVFormatContextInput::open(input_file_cstr.as_c_str(), None, &mut None)?;
+            AVFormatContextInput::open(input_file_cstr.as_c_str())?;
         input_ctx.dump(0, input_file_cstr.as_c_str())?;
 
         // Initialize output streams based on the first input file
