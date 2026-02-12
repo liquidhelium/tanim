@@ -69,6 +69,14 @@ pub enum EncoderInput {
     Raw(Vec<u8>),
 }
 
+#[cfg(feature = "typst-lib")]
+pub struct SceneData {
+    pub t: i32,
+    pub scene: vello::Scene,
+    pub width: u32,
+    pub height: u32,
+}
+
 impl VelloRendererState {
     fn new(gpu_state: Arc<GpuState>) -> Result<Self> {
         let renderer =
@@ -145,7 +153,7 @@ impl VelloRendererState {
             }
         }
 
-        if buffer_idx.is_none() && self.buffers.len() >= 3 {
+        if buffer_idx.is_none() && self.buffers.len() >= 15 {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("Waiting for buffer").entered();
             loop {
@@ -246,7 +254,7 @@ impl FrameDispatcher {
             frames_per_encoder,
         }
     }
-
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn dispatch(&self, frame_num: i32, frame: EncoderInput, begin_t: i32) {
         let target_encoder_index = (frame_num - begin_t) / self.frames_per_encoder;
         if let Some(sender) = self.encoders_senders.get(target_encoder_index as usize)
@@ -801,7 +809,7 @@ impl TypstVideoRenderer {
         }
     }
     #[cfg(feature = "typst-lib")]
-    #[cfg_attr(feature = "tracy" ,instrument)]
+    #[cfg_attr(feature = "tracy", instrument)]
     fn init_gpu_state() -> Result<GpuState> {
         let mut context = RenderContext::new();
         let device_id = pollster::block_on(context.device(None))
@@ -815,7 +823,104 @@ impl TypstVideoRenderer {
         Ok(GpuState { device, queue })
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "trace", skip_all))]
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg(feature = "typst-lib")]
+    fn compile_frame(&self, t: i32) -> Result<SceneData> {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("Waiting for lock").entered();
+        let mut universe = {
+            #[cfg(feature = "typst-bin")]
+            {
+                self.config.universe.as_ref().unwrap().lock().unwrap()
+            }
+            #[cfg(not(feature = "typst-bin"))]
+            {
+                self.config.universe.lock().unwrap()
+            }
+        };
+        universe.increment_revision(|univ| {
+            let input_func = &self.config.f_input;
+            univ.set_inputs(Arc::new(LazyHash::new(input_func(t))));
+        });
+        let world = universe.snapshot();
+
+        universe.evict(10);
+        typst::comemo::evict(10);
+        drop(universe); // release the lock as soon as possible
+        #[cfg(feature = "tracy")]
+        drop(_span);
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("compilation").entered();
+        let Warned { output, warnings } = typst::compile(&world);
+        #[cfg(feature = "tracy")]
+        drop(_span);
+        let doc: PagedDocument = {
+            if let Err(e) = print_diagnostics(
+                &world,
+                warnings.iter(),
+                tinymist_world::DiagnosticFormat::Human,
+            ) {
+                error!("Error printing diagnostics: {e}");
+            };
+            output.map_err(Error::TypstCompilation)?
+        };
+
+        let frame = doc.pages.first().ok_or(Error::NoPages)?;
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("rendering to pixmap").entered();
+        let mut scene = typst_vello::TypstScene::from_frame(&frame.frame);
+        let fragment = scene.render();
+        let mut scene = vello::Scene::new();
+        let scale = (self.config.ppi / 72.0) as f64;
+        scene.append(&fragment, Some(vello::kurbo::Affine::scale(scale)));
+
+        let width = (frame.frame.width().to_pt() * self.config.ppi as f64 / 72.0).ceil() as u32;
+        let height = (frame.frame.height().to_pt() * self.config.ppi as f64 / 72.0).ceil() as u32;
+
+        Ok(SceneData {
+            t,
+            scene,
+            width,
+            height,
+        })
+    }
+
+    #[cfg(feature = "typst-lib")]
+    fn render_scene(
+        &self,
+        data: SceneData,
+        vello_state: &mut Option<VelloRendererState>,
+    ) -> Result<EncoderInput> {
+        #[cfg(feature = "tracy")]
+        let _span_state = debug_span!("get vello state").entered();
+        let state = if let Some(state) = vello_state {
+            state
+        } else {
+            let gpu_state = if let Some(state) = self.gpu_state.get() {
+                state.clone()
+            } else {
+                let state = Arc::new(Self::init_gpu_state()?);
+                let _ = self.gpu_state.set(state.clone());
+                state
+            };
+            *vello_state = Some(VelloRendererState::new(gpu_state)?);
+            vello_state.as_mut().unwrap()
+        };
+        #[cfg(feature = "tracy")]
+        drop(_span_state);
+
+        #[cfg(feature = "tracy")]
+        let _span1 = debug_span!("rendering").entered();
+        let buffer = state.render(&data.scene, data.width, data.height)?;
+
+        // It's okay to ignore the result here, as we don't care if the size was already set.
+        // divide by 2 and multiply by 2 to ensure even dimensions, which is required by many video codecs.
+        let _ = self.size.set((data.width / 2 * 2, data.height / 2 * 2));
+        #[cfg(feature = "tracy")]
+        drop(_span1);
+        Ok(EncoderInput::Buffer(buffer, data.width, data.height))
+    }
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn render_frame(
         &self,
         t: i32,
@@ -831,82 +936,9 @@ impl TypstVideoRenderer {
 
         #[cfg(feature = "typst-lib")]
         {
-            let mut universe = {
-                #[cfg(feature = "typst-bin")]
-                {
-                    self.config.universe.as_ref().unwrap().lock().unwrap()
-                }
-                #[cfg(not(feature = "typst-bin"))]
-                {
-                    self.config.universe.lock().unwrap()
-                }
-            };
-            universe.increment_revision(|univ| {
-                let input_func = &self.config.f_input;
-                univ.set_inputs(Arc::new(LazyHash::new(input_func(t))));
-            });
-            let world = universe.snapshot();
+            let scene_data = self.compile_frame(t)?;
 
-            universe.evict(10);
-            typst::comemo::evict(10);
-            drop(universe); // release the lock as soon as possible
-            #[cfg(feature = "tracy")]
-            let _span = debug_span!("compilation").entered();
-            let Warned { output, warnings } = typst::compile(&world);
-            #[cfg(feature = "tracy")]
-            drop(_span);
-            let doc: PagedDocument = {
-                if let Err(e) = print_diagnostics(
-                    &world,
-                    warnings.iter(),
-                    tinymist_world::DiagnosticFormat::Human,
-                ) {
-                    error!("Error printing diagnostics: {e}");
-                };
-                output.map_err(Error::TypstCompilation)?
-            };
-
-            let frame = doc.pages.first().ok_or(Error::NoPages)?;
-            #[cfg(feature = "tracy")]
-            let _span = debug_span!("rendering to pixmap").entered();
-            let mut scene = typst_vello::TypstScene::from_frame(&frame.frame);
-            let fragment = scene.render();
-            let mut scene = vello::Scene::new();
-            let scale = (self.config.ppi / 72.0) as f64;
-            scene.append(&fragment, Some(vello::kurbo::Affine::scale(scale)));
-
-            let width = (frame.frame.width().to_pt() * self.config.ppi as f64 / 72.0).ceil() as u32;
-            let height =
-                (frame.frame.height().to_pt() * self.config.ppi as f64 / 72.0).ceil() as u32;
-            #[cfg(feature = "tracy")]
-            let _span1 = debug_span!("get vello state").entered();
-            let state = if let Some(state) = vello_state {
-                state
-            } else {
-                let gpu_state = if let Some(state) = self.gpu_state.get() {
-                    state.clone()
-                } else {
-                    let state = Arc::new(Self::init_gpu_state()?);
-                    let _ = self.gpu_state.set(state.clone());
-                    state
-                };
-                *vello_state = Some(VelloRendererState::new(gpu_state)?);
-                vello_state.as_mut().unwrap()
-            };
-            #[cfg(feature = "tracy")]
-            drop(_span1);
-            #[cfg(feature = "tracy")]
-            let _span1 = debug_span!("rendering").entered();
-            let buffer = state.render(&scene, width, height)?;
-
-            // It's okay to ignore the result here, as we don't care if the size was already set.
-            // divide by 2 and multiply by 2 to ensure even dimensions, which is required by many video codecs.
-            let _ = self.size.set((width / 2 * 2, height / 2 * 2));
-            #[cfg(feature = "tracy")]
-            drop(_span1);
-            #[cfg(feature = "tracy")]
-            drop(_span);
-            Ok(EncoderInput::Buffer(buffer, width, height))
+            self.render_scene(scene_data, vello_state)
         }
         #[cfg(not(feature = "typst-lib"))]
         {
@@ -1087,12 +1119,13 @@ impl TypstVideoRenderer {
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
         // each worker should handle at least one frame
+        let logical_cores = num_cpus::get();
         let num_render_workers = self
             .config
             .rendering_threads
-            .unwrap_or_else(|| (num_cpus::get() - 2).clamp(1, (end_t - begin_t + 1) as usize));
+            .unwrap_or_else(|| (logical_cores / 2).clamp(1, (end_t - begin_t + 1) as usize));
         let num_encode_workers = self.config.encoding_threads.unwrap_or_else(|| {
-            (num_cpus::get() - num_render_workers).clamp(1, (end_t - begin_t + 1) as usize)
+            (num_render_workers).clamp(1, (end_t - begin_t + 1) as usize)
         });
         let frames_per_encoder = (end_t - begin_t) / num_encode_workers as i32;
 
@@ -1206,6 +1239,80 @@ impl TypstVideoRenderer {
         dispatcher: FrameDispatcher,
         count: usize,
     ) -> Vec<thread::JoinHandle<()>> {
+        #[cfg(feature = "typst-bin")]
+        let use_bin = self.config.typst_command.is_some();
+        #[cfg(not(feature = "typst-bin"))]
+        let use_bin = false;
+
+        #[cfg(feature = "typst-lib")]
+        if !use_bin {
+            let begin_t = self.config.begin_t;
+            let end_t = self.config.end_t;
+            let frames_per_renderer = (end_t - begin_t) / count as i32;
+            let (scene_tx, scene_rx) = channel::bounded(count * 5);
+            let mut handles = Vec::new();
+
+            // Spawn Compiler Workers
+            for i in 0..count {
+                let chunk_begin_t = begin_t + i as i32 * frames_per_renderer;
+                let chunk_end_t = if i == count - 1 {
+                    end_t
+                } else {
+                    chunk_begin_t + frames_per_renderer
+                };
+
+                let self_clone = self.clone();
+                let scene_tx_clone = scene_tx.clone();
+                let stop_signal_clone = stop_signal.clone();
+                let error_signal_clone = error_signal.clone();
+
+                handles.push(
+                    thread::Builder::new()
+                        .name(format!("compiler-{i}"))
+                        .spawn(move || {
+                            self_clone.compile_chunk(
+                                chunk_begin_t,
+                                chunk_end_t,
+                                scene_tx_clone,
+                                stop_signal_clone,
+                                error_signal_clone,
+                            );
+                        })
+                        .unwrap(),
+                );
+            }
+            // Drop original sender so receiver knows when to stop
+            drop(scene_tx);
+
+            // Spawn GPU Workers
+            let gpu_worker_count = 2;
+            for i in 0..gpu_worker_count {
+                let self_clone = self.clone();
+                let scene_rx_clone = scene_rx.clone();
+                let dispatcher_clone = dispatcher.clone();
+                let rendering_span_clone = rendering_span.clone();
+                let stop_signal_clone = stop_signal.clone();
+                let error_signal_clone = error_signal.clone();
+
+                handles.push(
+                    thread::Builder::new()
+                        .name(format!("gpu-renderer-{i}"))
+                        .spawn(move || {
+                            self_clone.gpu_loop(
+                                scene_rx_clone,
+                                dispatcher_clone,
+                                rendering_span_clone,
+                                stop_signal_clone,
+                                error_signal_clone,
+                            );
+                        })
+                        .unwrap(),
+                );
+            }
+
+            return handles;
+        }
+
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
         let frames_per_renderer = (end_t - begin_t) / count as i32;
@@ -1240,6 +1347,80 @@ impl TypstVideoRenderer {
                     .unwrap()
             })
             .collect()
+    }
+
+    #[cfg(feature = "typst-lib")]
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    fn compile_chunk(
+        &self,
+        chunk_begin_t: i32,
+        chunk_end_t: i32,
+        scene_tx: channel::Sender<SceneData>,
+        stop_signal: Arc<AtomicBool>,
+        error_signal: Arc<AtomicBool>,
+    ) {
+        for t in chunk_begin_t..chunk_end_t {
+            if stop_signal.load(Ordering::SeqCst) {
+                break;
+            }
+            match self.compile_frame(t) {
+                Ok(data) => {
+                    #[cfg(feature = "tracy")]
+                    let span = debug_span!("send data").entered();
+                    if scene_tx.send(data).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error compiling frame {t}: {e}");
+                    stop_signal.store(true, Ordering::SeqCst);
+                    error_signal.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "typst-lib")]
+    fn gpu_loop(
+        &self,
+        scene_rx: channel::Receiver<SceneData>,
+        dispatcher: FrameDispatcher,
+        rendering_span: Span,
+        stop_signal: Arc<AtomicBool>,
+        error_signal: Arc<AtomicBool>,
+    ) {
+        let mut vello_state = None;
+        let begin_t = self.config.begin_t;
+        for data in scene_rx {
+            if stop_signal.load(Ordering::SeqCst) {
+                break;
+            }
+            let t = data.t;
+            match self.render_scene(data, &mut vello_state) {
+                Ok(input) => {
+                    match input {
+                        EncoderInput::Buffer(buffer, width, height) => {
+                            dispatcher.dispatch(
+                                t,
+                                EncoderInput::Buffer(buffer, width, height),
+                                begin_t,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    if !stop_signal.load(Ordering::SeqCst) {
+                        rendering_span.pb_inc(1);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error rendering frame {t}: {e}");
+                    stop_signal.store(true, Ordering::SeqCst);
+                    error_signal.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
     }
 
     fn render_chunk(
@@ -1281,11 +1462,7 @@ impl TypstVideoRenderer {
                             } else {
                                 raw_frame
                             };
-                            dispatcher.dispatch(
-                                t,
-                                EncoderInput::Raw(frame_to_dispatch),
-                                begin_t,
-                            );
+                            dispatcher.dispatch(t, EncoderInput::Raw(frame_to_dispatch), begin_t);
                         }
                     }
 
