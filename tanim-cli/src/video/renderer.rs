@@ -587,11 +587,12 @@ impl TypstVideoRenderer {
                 univ.set_inputs(Arc::new(LazyHash::new(input_func(t))));
             });
             let world = universe.snapshot();
+
             universe.evict(10);
             typst::comemo::evict(10);
             drop(universe); // release the lock as soon as possible
             #[cfg(feature = "tracy")]
-            let _span = debug_span!("compilation", frame = t).entered();
+            let _span = debug_span!("compilation").entered();
             let Warned { output, warnings } = typst::compile(&world);
             #[cfg(feature = "tracy")]
             drop(_span);
@@ -607,7 +608,11 @@ impl TypstVideoRenderer {
             };
 
             let frame = doc.pages.first().ok_or(Error::NoPages)?;
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("rendering to pixmap").entered();
             let pixmap = render(frame, self.config.ppi / 72.0);
+            #[cfg(feature = "tracy")]
+            drop(_span);
             // It's okay to ignore the result here, as we don't care if the size was already set.
             // divide by 2 and multiply by 2 to ensure even dimensions, which is required by many video codecs.
             let _ = self.size.set((
