@@ -52,6 +52,9 @@ pub enum Error {
 
     #[error("Failed to create sws context")]
     SwsContextCreation,
+
+    #[error("Vello error: {0}")]
+    Vello(anyhow::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

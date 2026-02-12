@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 typst = {workspace = true, optional = true}
 typst-render = {workspace = true, optional = true}
+typst_vello = {git = "https://github.com/voxell-tech/velyst", rev = "5016cc5fc4355da2ca21a55e5130c6da07364e9e"}
 tinymist-world = {workspace = true, optional = true}
 # HACK: tinymist-world 0.14.6 has misconfigured feature sets.
 # this dependency is added to force cargo to enable those features.
@@ -24,6 +25,7 @@ ndarray = "0.17"
 num_cpus = "1.17.0"
 tempfile = "3.10.1"
 clap = {version = "4.5.48", features = ["derive"]}
+vello = "0.7.0"
 anyhow = "1.0.100"
 indicatif = "0.18.0"
 tracing-indicatif = "0.3.1"
@@ -31,6 +33,8 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "registry"]
 tracing-tracy = {version = "0.11.4", optional = true}
 zstd = "0.13.1"
 once_cell = "1.21.3"
+pollster = "0.3.0"
+futures-intrusive = "0.5.0"
 
 [features]
 default = ["embedded-ffmpeg", "ffmpeg-bin", "typst-bin", "typst-lib"]

@@ -38,13 +38,171 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 #[cfg(feature = "typst-lib")]
 use typst::{diag::Warned, layout::PagedDocument, utils::LazyHash};
 #[cfg(feature = "typst-lib")]
-use typst_render::render;
+use vello::util::RenderContext;
+#[cfg(feature = "typst-lib")]
+use vello::wgpu;
 
 use super::{
     config::RenderConfig,
     error::{Error, Result},
     merger::merge_mp4_files,
 };
+#[cfg(feature = "typst-lib")]
+struct GpuState {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+#[cfg(feature = "typst-lib")]
+struct VelloRendererState {
+    gpu_state: Arc<GpuState>,
+    renderer: vello::Renderer,
+    texture: Option<wgpu::Texture>,
+    buffer: Option<wgpu::Buffer>,
+    width: u32,
+    height: u32,
+}
+#[cfg(feature = "typst-lib")]
+impl VelloRendererState {
+    fn new(gpu_state: Arc<GpuState>) -> Result<Self> {
+
+        #[cfg(feature = "tracy")]
+        let _span1 = debug_span!("Creating vello Renderer").entered();
+        info!("Creating a vello renderer");
+        let renderer = vello::Renderer::new(
+            &gpu_state.device,
+            vello::RendererOptions {
+                use_cpu: false,
+                num_init_threads: std::num::NonZeroUsize::new(1),
+                antialiasing_support: vello::AaSupport::area_only(),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create renderer: {:?}", e))
+        .map_err(Error::Vello)?;
+        #[cfg(feature = "tracy")]
+        drop(_span1);
+
+        Ok(Self {
+            gpu_state,
+            renderer,
+            texture: None,
+            buffer: None,
+            width: 0,
+            height: 0,
+        })
+    }
+
+    fn render(&mut self, scene: &vello::Scene, width: u32, height: u32) -> Result<Vec<u8>> {
+        let device = &self.gpu_state.device;
+        let queue = &self.gpu_state.queue;
+        if self.width != width || self.height != height || self.texture.is_none() {
+            #[cfg(feature = "tracy")]
+            let _span1 = debug_span!("Creating texture").entered();
+            self.width = width;
+            self.height = height;
+
+            let size = wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            };
+
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Target texture"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            self.texture = Some(texture);
+
+            let padded_byte_width = (width * 4).next_multiple_of(256);
+            let buffer_size = padded_byte_width as u64 * height as u64;
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("val"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.buffer = Some(buffer);
+        }
+
+        let texture = self.texture.as_ref().unwrap();
+        let buffer = self.buffer.as_ref().unwrap();
+
+        #[cfg(feature = "tracy")]
+        let _span1 = debug_span!("Creating texture view").entered();
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let render_params = vello::RenderParams {
+            base_color: vello::peniko::Color::WHITE,
+            width,
+            height,
+            antialiasing_method: vello::AaConfig::Area,
+        };
+
+        #[cfg(feature = "tracy")]
+        drop(_span1);
+        self.renderer
+            .render_to_texture(device, queue, scene, &view, &render_params)
+            .map_err(|e| anyhow::anyhow!("Rendering failed: {:?}", e))
+            .map_err(Error::Vello)?;
+
+        let padded_byte_width = (width * 4).next_multiple_of(256);
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Copy out buffer"),
+        });
+
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_byte_width),
+                    rows_per_image: None,
+                },
+            },
+            size,
+        );
+
+        queue.submit([encoder.finish()]);
+        let buf_slice = buffer.slice(..);
+
+        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        buf_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+
+        if let Some(recv_result) = vello::util::block_on_wgpu(device, receiver.receive()) {
+            recv_result
+                .map_err(|e| anyhow::anyhow!("Buffer map failed: {:?}", e))
+                .map_err(Error::Vello)?;
+        } else {
+            return Err(Error::Vello(anyhow::anyhow!("channel was closed")));
+        }
+
+        let data = buf_slice.get_mapped_range();
+        let mut result_unpadded = Vec::<u8>::with_capacity((width * height * 4) as usize);
+        for row in 0..height {
+            let start = (row * padded_byte_width) as usize;
+            result_unpadded.extend_from_slice(&data[start..start + (width * 4) as usize]);
+        }
+
+        // Drop the mapped view so we can unmap
+        drop(data);
+        buffer.unmap();
+
+        Ok(result_unpadded)
+    }
+}
 
 type EncoderSenderVec = Vec<channel::Sender<(i32, Vec<u8>)>>;
 
@@ -546,6 +704,8 @@ impl FrameEncoder {
 pub struct TypstVideoRenderer {
     config: RenderConfig,
     size: OnceLock<(u32, u32)>,
+    #[cfg(feature = "typst-lib")]
+    gpu_state: OnceLock<Arc<GpuState>>,
 }
 
 struct SpawnRenderWorkersResult(
@@ -560,11 +720,31 @@ impl TypstVideoRenderer {
         Self {
             config,
             size: OnceLock::new(),
+            #[cfg(feature = "typst-lib")]
+            gpu_state: OnceLock::new(),
         }
     }
+    #[cfg(feature = "typst-lib")]
+    #[cfg_attr(feature = "tracy" ,instrument)]
+    fn init_gpu_state() -> Result<GpuState> {
+        let mut context = RenderContext::new();
+        let device_id = pollster::block_on(context.device(None))
+            .ok_or_else(|| anyhow::anyhow!("No compatible device found"))
+            .map_err(Error::Vello)?;
 
-    #[cfg_attr(feature = "tracy", instrument(level = "trace", skip(self)))]
-    fn render_frame(&self, t: i32) -> Result<tiny_skia::Pixmap> {
+        let device_handle = &context.devices[device_id];
+        let device = device_handle.device.clone();
+        let queue = device_handle.queue.clone();
+
+        Ok(GpuState { device, queue })
+    }
+
+    #[cfg_attr(feature = "tracy", instrument(level = "trace", skip_all))]
+    fn render_frame(
+        &self,
+        t: i32,
+        #[cfg(feature = "typst-lib")] vello_state: &mut Option<VelloRendererState>,
+    ) -> Result<tiny_skia::Pixmap> {
         #[cfg(feature = "typst-bin")]
         if let Some(command) = &self.config.typst_command {
             return self.render_frame_bin(t, command);
@@ -610,7 +790,43 @@ impl TypstVideoRenderer {
             let frame = doc.pages.first().ok_or(Error::NoPages)?;
             #[cfg(feature = "tracy")]
             let _span = debug_span!("rendering to pixmap").entered();
-            let pixmap = render(frame, self.config.ppi / 72.0);
+            let mut scene = typst_vello::TypstScene::from_frame(&frame.frame);
+            let fragment = scene.render();
+            let mut scene = vello::Scene::new();
+            let scale = (self.config.ppi / 72.0) as f64;
+            scene.append(&fragment, Some(vello::kurbo::Affine::scale(scale)));
+
+            let width = (frame.frame.width().to_pt() * self.config.ppi as f64 / 72.0).ceil() as u32;
+            let height =
+                (frame.frame.height().to_pt() * self.config.ppi as f64 / 72.0).ceil() as u32;
+            #[cfg(feature = "tracy")]
+            let _span1 = debug_span!("get vello state").entered();
+            let state = if let Some(state) = vello_state {
+                state
+            } else {
+                let gpu_state = if let Some(state) = self.gpu_state.get() {
+                    state.clone()
+                } else {
+                    let state = Arc::new(Self::init_gpu_state()?);
+                    let _ = self.gpu_state.set(state.clone());
+                    state
+                };
+                *vello_state = Some(VelloRendererState::new(gpu_state)?);
+                vello_state.as_mut().unwrap()
+            };
+            #[cfg(feature = "tracy")]
+            drop(_span1);
+            #[cfg(feature = "tracy")]
+            let _span1 = debug_span!("get vello state").entered();
+            let result_unpadded = state.render(&scene, width, height)?;
+
+            let pixmap = Pixmap::from_vec(
+                result_unpadded,
+                tiny_skia::IntSize::from_wh(width, height).unwrap(),
+            )
+            .ok_or(Error::PixmapCreation)?;
+            #[cfg(feature = "tracy")]
+            drop(_span1);
             #[cfg(feature = "tracy")]
             drop(_span);
             // It's okay to ignore the result here, as we don't care if the size was already set.
@@ -782,6 +998,21 @@ impl TypstVideoRenderer {
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
     ) -> SpawnRenderWorkersResult {
+        #[cfg(feature = "typst-lib")]
+        // Initialize GPU state once before spawning workers
+        if self.gpu_state.get().is_none() {
+            info!("Initializing GPU state");
+            match Self::init_gpu_state() {
+                Ok(state) => {
+                    let _ = self.gpu_state.set(Arc::new(state));
+                }
+                Err(e) => {
+                    error!("Failed to initialize GPU state: {e}");
+                }
+            }
+            info!("GPU state initialized");
+        }
+
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
         // each worker should handle at least one frame
@@ -943,12 +1174,20 @@ impl TypstVideoRenderer {
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
     ) {
+        #[cfg(feature = "typst-lib")]
+        let mut vello_state = None;
+
         let begin_t = self.config.begin_t;
         for t in chunk_begin_t..chunk_end_t {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
             }
-            match self.render_frame(t) {
+            #[cfg(feature = "typst-lib")]
+            let res = self.render_frame(t, &mut vello_state);
+            #[cfg(not(feature = "typst-lib"))]
+            let res = self.render_frame(t);
+
+            match res {
                 Ok(pixmap) => match Self::process_frame(pixmap) {
                     Ok(frame) => {
                         let raw_frame = frame.into_raw_vec_and_offset().0;
