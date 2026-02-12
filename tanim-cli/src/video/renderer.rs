@@ -788,9 +788,9 @@ impl TypstVideoRenderer {
         let num_render_workers = self
             .config
             .rendering_threads
-            .unwrap_or_else(|| (num_cpus::get() - 2).clamp(1, (end_t - begin_t + 1) as usize));
+            .unwrap_or_else(|| (num_cpus::get() / 2).clamp(1, (end_t - begin_t + 1) as usize));
         let num_encode_workers = self.config.encoding_threads.unwrap_or_else(|| {
-            (num_cpus::get() - num_render_workers).clamp(1, (end_t - begin_t + 1) as usize)
+            (num_render_workers).clamp(1, (end_t - begin_t + 1) as usize)
         });
         let frames_per_encoder = (end_t - begin_t) / num_encode_workers as i32;
 
