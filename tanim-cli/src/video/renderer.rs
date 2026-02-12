@@ -57,42 +57,39 @@ struct VelloRendererState {
     gpu_state: Arc<GpuState>,
     renderer: vello::Renderer,
     texture: Option<wgpu::Texture>,
-    buffer: Option<wgpu::Buffer>,
+    buffers: Vec<Arc<wgpu::Buffer>>,
+    free_buffers: Vec<usize>,
     width: u32,
     height: u32,
 }
-#[cfg(feature = "typst-lib")]
+
+pub enum EncoderInput {
+    #[cfg(feature = "typst-lib")]
+    Buffer(Arc<wgpu::Buffer>, u32, u32),
+    Raw(Vec<u8>),
+}
+
 impl VelloRendererState {
     fn new(gpu_state: Arc<GpuState>) -> Result<Self> {
-
-        #[cfg(feature = "tracy")]
-        let _span1 = debug_span!("Creating vello Renderer").entered();
-        info!("Creating a vello renderer");
-        let renderer = vello::Renderer::new(
-            &gpu_state.device,
-            vello::RendererOptions {
-                use_cpu: false,
-                num_init_threads: std::num::NonZeroUsize::new(1),
-                antialiasing_support: vello::AaSupport::area_only(),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create renderer: {:?}", e))
-        .map_err(Error::Vello)?;
-        #[cfg(feature = "tracy")]
-        drop(_span1);
-
+        let renderer =
+            vello::Renderer::new(&gpu_state.device, vello::RendererOptions::default()).unwrap();
         Ok(Self {
             gpu_state,
             renderer,
             texture: None,
-            buffer: None,
+            buffers: Vec::new(),
+            free_buffers: Vec::new(),
             width: 0,
             height: 0,
         })
     }
 
-    fn render(&mut self, scene: &vello::Scene, width: u32, height: u32) -> Result<Vec<u8>> {
+    fn render(
+        &mut self,
+        scene: &vello::Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<Arc<wgpu::Buffer>> {
         let device = &self.gpu_state.device;
         let queue = &self.gpu_state.queue;
         if self.width != width || self.height != height || self.texture.is_none() {
@@ -121,17 +118,66 @@ impl VelloRendererState {
 
             let padded_byte_width = (width * 4).next_multiple_of(256);
             let buffer_size = padded_byte_width as u64 * height as u64;
+            self.buffers.clear();
+            self.free_buffers.clear();
+            for i in 0..3 {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("val"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.buffers.push(Arc::new(buffer));
+                self.free_buffers.push(i);
+            }
+        }
+
+        let texture = self.texture.as_ref().unwrap();
+
+        // Check if any buffer is free
+        let mut buffer_idx = None;
+        // Simple check: iterate all buffers, if strong_count is 1, it means it's free (only held by self.buffers)
+        // This is a simple way to implement a buffer pool without mutex
+        for (i, buffer) in self.buffers.iter().enumerate() {
+            if Arc::strong_count(buffer) == 1 {
+                buffer_idx = Some(i);
+                break;
+            }
+        }
+
+        if buffer_idx.is_none() && self.buffers.len() >= 3 {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("Waiting for buffer").entered();
+            loop {
+                for (i, buffer) in self.buffers.iter().enumerate() {
+                    if Arc::strong_count(buffer) == 1 {
+                        buffer_idx = Some(i);
+                        break;
+                    }
+                }
+                if buffer_idx.is_some() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        let buffer = if let Some(idx) = buffer_idx {
+            self.buffers[idx].clone()
+        } else {
+            // No free buffer, create a new one (should rarely happen if pool size is enough)
+            let padded_byte_width = (width * 4).next_multiple_of(256);
+            let buffer_size = padded_byte_width as u64 * height as u64;
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("val"),
                 size: buffer_size,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.buffer = Some(buffer);
-        }
-
-        let texture = self.texture.as_ref().unwrap();
-        let buffer = self.buffer.as_ref().unwrap();
+            let buffer = Arc::new(buffer);
+            self.buffers.push(buffer.clone());
+            buffer
+        };
 
         #[cfg(feature = "tracy")]
         let _span1 = debug_span!("Creating texture view").entered();
@@ -146,10 +192,14 @@ impl VelloRendererState {
 
         #[cfg(feature = "tracy")]
         drop(_span1);
+        #[cfg(feature = "tracy")]
+        let _span1 = debug_span!("Rendering").entered();
         self.renderer
             .render_to_texture(device, queue, scene, &view, &render_params)
             .map_err(|e| anyhow::anyhow!("Rendering failed: {:?}", e))
             .map_err(Error::Vello)?;
+        #[cfg(feature = "tracy")]
+        drop(_span1);
 
         let padded_byte_width = (width * 4).next_multiple_of(256);
         let size = wgpu::Extent3d {
@@ -165,7 +215,7 @@ impl VelloRendererState {
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
-                buffer,
+                buffer: &buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_byte_width),
@@ -176,35 +226,12 @@ impl VelloRendererState {
         );
 
         queue.submit([encoder.finish()]);
-        let buf_slice = buffer.slice(..);
 
-        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-        buf_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
-
-        if let Some(recv_result) = vello::util::block_on_wgpu(device, receiver.receive()) {
-            recv_result
-                .map_err(|e| anyhow::anyhow!("Buffer map failed: {:?}", e))
-                .map_err(Error::Vello)?;
-        } else {
-            return Err(Error::Vello(anyhow::anyhow!("channel was closed")));
-        }
-
-        let data = buf_slice.get_mapped_range();
-        let mut result_unpadded = Vec::<u8>::with_capacity((width * height * 4) as usize);
-        for row in 0..height {
-            let start = (row * padded_byte_width) as usize;
-            result_unpadded.extend_from_slice(&data[start..start + (width * 4) as usize]);
-        }
-
-        // Drop the mapped view so we can unmap
-        drop(data);
-        buffer.unmap();
-
-        Ok(result_unpadded)
+        Ok(buffer)
     }
 }
 
-type EncoderSenderVec = Vec<channel::Sender<(i32, Vec<u8>)>>;
+type EncoderSenderVec = Vec<channel::Sender<(usize, EncoderInput)>>;
 
 #[derive(Clone)]
 struct FrameDispatcher {
@@ -220,10 +247,10 @@ impl FrameDispatcher {
         }
     }
 
-    fn dispatch(&self, frame_num: i32, frame: Vec<u8>, begin_t: i32) {
+    fn dispatch(&self, frame_num: i32, frame: EncoderInput, begin_t: i32) {
         let target_encoder_index = (frame_num - begin_t) / self.frames_per_encoder;
         if let Some(sender) = self.encoders_senders.get(target_encoder_index as usize)
-            && sender.send((frame_num, frame)).is_err()
+            && sender.send((frame_num as usize, frame)).is_err()
         {
             // Encoder thread might have panicked and closed the channel.
             // This will be handled when the main thread tries to join the encoder thread.
@@ -258,6 +285,8 @@ enum EncoderBackend {
 
 struct FrameEncoder {
     backend: EncoderBackend,
+    #[cfg(feature = "typst-lib")]
+    gpu_device: wgpu::Device,
     received_frames: BTreeMap<i32, Vec<u8>>,
     next_expected: i32,
     width: u32,
@@ -276,6 +305,7 @@ impl FrameEncoder {
         fps: u32,
         begin_t: i32,
         video_begin_t: i32,
+        #[cfg(feature = "typst-lib")] gpu_device: wgpu::Device,
         ffmpeg_options: HashMap<String, String>,
         zstd_level: Option<i32>,
         #[cfg(feature = "ffmpeg-bin")] ffmpeg_path: Option<String>,
@@ -434,6 +464,8 @@ impl FrameEncoder {
 
         Ok(Self {
             backend,
+            #[cfg(feature = "typst-lib")]
+            gpu_device,
             received_frames: BTreeMap::new(),
             next_expected: begin_t,
             width,
@@ -447,13 +479,57 @@ impl FrameEncoder {
     fn encode_frame(
         &mut self,
         frame_num: i32,
-        frame: Vec<u8>,
+        frame: EncoderInput,
         encode_progress: Option<&Span>,
-        stop_signal: &Arc<AtomicBool>,
+        stop_signal: &AtomicBool,
     ) -> Result<()> {
-        #[cfg(feature = "tracy")]
-        let _span = tracing::debug_span!("encoder_recv", frame_num = frame_num).entered();
-        self.received_frames.insert(frame_num, frame);
+        let frame_data = match frame {
+            EncoderInput::Raw(data) => data,
+            #[cfg(feature = "typst-lib")]
+            EncoderInput::Buffer(buffer, width, height) => {
+                let padded_byte_width = (width * 4).next_multiple_of(256);
+                let buf_slice = buffer.slice(..);
+
+                let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+                buf_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+
+                if let Some(recv_result) =
+                    vello::util::block_on_wgpu(&self.gpu_device, receiver.receive())
+                {
+                    recv_result
+                        .map_err(|e| anyhow::anyhow!("Buffer map failed: {:?}", e))
+                        .map_err(Error::Vello)?;
+                } else {
+                    return Err(Error::Vello(anyhow::anyhow!("channel was closed")));
+                }
+
+                let data = buf_slice.get_mapped_range();
+                let mut result_unpadded = Vec::<u8>::with_capacity((width * height * 4) as usize);
+                for row in 0..height {
+                    let start = (row * padded_byte_width) as usize;
+                    result_unpadded.extend_from_slice(&data[start..start + (width * 4) as usize]);
+                }
+
+                // Drop the mapped view so we can unmap
+                drop(data);
+                buffer.unmap();
+
+                let pixmap = Pixmap::from_vec(
+                    result_unpadded,
+                    tiny_skia::IntSize::from_wh(width, height).unwrap(),
+                )
+                .ok_or(Error::PixmapCreation)?;
+                let frame = TypstVideoRenderer::process_frame(pixmap)?;
+                let raw_frame = frame.into_raw_vec_and_offset().0;
+                if let Some(level) = self.zstd_level {
+                    zstd::encode_all(&raw_frame[..], level).unwrap()
+                } else {
+                    raw_frame
+                }
+            }
+        };
+
+        self.received_frames.insert(frame_num, frame_data);
         while let Some(received_frame) = self.received_frames.remove(&self.next_expected) {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
@@ -744,10 +820,13 @@ impl TypstVideoRenderer {
         &self,
         t: i32,
         #[cfg(feature = "typst-lib")] vello_state: &mut Option<VelloRendererState>,
-    ) -> Result<tiny_skia::Pixmap> {
+    ) -> Result<EncoderInput> {
         #[cfg(feature = "typst-bin")]
         if let Some(command) = &self.config.typst_command {
-            return self.render_frame_bin(t, command);
+            let pixmap = self.render_frame_bin(t, command)?;
+            let frame = Self::process_frame(pixmap)?;
+            let raw_frame = frame.into_raw_vec_and_offset().0;
+            return Ok(EncoderInput::Raw(raw_frame));
         }
 
         #[cfg(feature = "typst-lib")]
@@ -817,25 +896,17 @@ impl TypstVideoRenderer {
             #[cfg(feature = "tracy")]
             drop(_span1);
             #[cfg(feature = "tracy")]
-            let _span1 = debug_span!("get vello state").entered();
-            let result_unpadded = state.render(&scene, width, height)?;
+            let _span1 = debug_span!("rendering").entered();
+            let buffer = state.render(&scene, width, height)?;
 
-            let pixmap = Pixmap::from_vec(
-                result_unpadded,
-                tiny_skia::IntSize::from_wh(width, height).unwrap(),
-            )
-            .ok_or(Error::PixmapCreation)?;
+            // It's okay to ignore the result here, as we don't care if the size was already set.
+            // divide by 2 and multiply by 2 to ensure even dimensions, which is required by many video codecs.
+            let _ = self.size.set((width / 2 * 2, height / 2 * 2));
             #[cfg(feature = "tracy")]
             drop(_span1);
             #[cfg(feature = "tracy")]
             drop(_span);
-            // It's okay to ignore the result here, as we don't care if the size was already set.
-            // divide by 2 and multiply by 2 to ensure even dimensions, which is required by many video codecs.
-            let _ = self.size.set((
-                pixmap.width() as u32 / 2 * 2,
-                pixmap.height() as u32 / 2 * 2,
-            ));
-            Ok(pixmap)
+            Ok(EncoderInput::Buffer(buffer, width, height))
         }
         #[cfg(not(feature = "typst-lib"))]
         {
@@ -897,7 +968,7 @@ impl TypstVideoRenderer {
     }
 
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip(pixmap)))]
-    fn process_frame(pixmap: Pixmap) -> Result<Array3<u8>> {
+    pub(crate) fn process_frame(pixmap: Pixmap) -> Result<Array3<u8>> {
         let width = pixmap.width();
         let height = pixmap.height();
 
@@ -1061,12 +1132,14 @@ impl TypstVideoRenderer {
         encoding_span: Span,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
-        encoder_receivers: Vec<channel::Receiver<(i32, Vec<u8>)>>,
+        encoder_receivers: Vec<channel::Receiver<(usize, EncoderInput)>>,
     ) -> (
         Vec<thread::JoinHandle<Result<()>>>,
         Vec<tempfile::NamedTempFile>,
     ) {
         let &(width, height) = self.size.wait();
+        #[cfg(feature = "typst-lib")]
+        let gpu_device = self.gpu_state.get().unwrap().device.clone();
         let num_encode_workers = encoder_receivers.len();
         let begin_t = self.config.begin_t;
         let end_t = self.config.end_t;
@@ -1095,6 +1168,8 @@ impl TypstVideoRenderer {
             let encoding_span = encoding_span.clone();
             let video_begin_t = begin_t;
 
+            #[cfg(feature = "typst-lib")]
+            let gpu_device = gpu_device.clone();
             let encode_thread = thread::Builder::new()
                 .name(format!("encoder-{i}"))
                 .spawn(move || {
@@ -1113,6 +1188,8 @@ impl TypstVideoRenderer {
                         ffmpeg_path,
                         stop_signal1,
                         error_signal1,
+                        #[cfg(feature = "typst-lib")]
+                        gpu_device,
                     )
                 })
                 .unwrap();
@@ -1188,26 +1265,34 @@ impl TypstVideoRenderer {
             let res = self.render_frame(t);
 
             match res {
-                Ok(pixmap) => match Self::process_frame(pixmap) {
-                    Ok(frame) => {
-                        let raw_frame = frame.into_raw_vec_and_offset().0;
-                        let frame_to_dispatch = if let Some(level) = self.config.zstd_level {
-                            zstd::encode_all(&raw_frame[..], level).unwrap()
-                        } else {
-                            raw_frame
-                        };
-                        dispatcher.dispatch(t, frame_to_dispatch, begin_t);
-                        if !stop_signal.load(Ordering::SeqCst) {
-                            rendering_span.pb_inc(1);
+                Ok(input) => {
+                    match input {
+                        #[cfg(feature = "typst-lib")]
+                        EncoderInput::Buffer(buffer, width, height) => {
+                            dispatcher.dispatch(
+                                t,
+                                EncoderInput::Buffer(buffer, width, height),
+                                begin_t,
+                            );
+                        }
+                        EncoderInput::Raw(raw_frame) => {
+                            let frame_to_dispatch = if let Some(level) = self.config.zstd_level {
+                                zstd::encode_all(&raw_frame[..], level).unwrap()
+                            } else {
+                                raw_frame
+                            };
+                            dispatcher.dispatch(
+                                t,
+                                EncoderInput::Raw(frame_to_dispatch),
+                                begin_t,
+                            );
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Error processing frame {t}: {e}");
-                        stop_signal.store(true, Ordering::SeqCst);
-                        error_signal.store(true, Ordering::SeqCst);
-                        break;
+
+                    if !stop_signal.load(Ordering::SeqCst) {
+                        rendering_span.pb_inc(1);
                     }
-                },
+                }
                 Err(e) => {
                     tracing::error!("Error rendering frame {t}: {e}");
                     stop_signal.store(true, Ordering::SeqCst);
@@ -1276,7 +1361,7 @@ impl TypstVideoRenderer {
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all, fields(output_path = %output_path)))]
     #[allow(clippy::too_many_arguments)]
     fn encode_video(
-        rx: channel::Receiver<(i32, Vec<u8>)>,
+        rx: channel::Receiver<(usize, EncoderInput)>,
         width: u32,
         height: u32,
         fps: u32,
@@ -1289,6 +1374,7 @@ impl TypstVideoRenderer {
         #[cfg(feature = "ffmpeg-bin")] ffmpeg_path: Option<String>,
         stop_signal: Arc<AtomicBool>,
         error_signal: Arc<AtomicBool>,
+        #[cfg(feature = "typst-lib")] gpu_device: wgpu::Device,
     ) -> Result<()> {
         let mut encoder = FrameEncoder::new(
             output_path,
@@ -1297,6 +1383,8 @@ impl TypstVideoRenderer {
             fps,
             begin_t,
             video_begin_t,
+            #[cfg(feature = "typst-lib")]
+            gpu_device,
             ffmpeg_options,
             zstd_level,
             #[cfg(feature = "ffmpeg-bin")]
@@ -1307,9 +1395,12 @@ impl TypstVideoRenderer {
             if stop_signal.load(Ordering::SeqCst) {
                 break;
             }
-            if let Err(e) =
-                encoder.encode_frame(frame_num, frame, encode_progress.as_ref(), &stop_signal)
-            {
+            if let Err(e) = encoder.encode_frame(
+                frame_num as i32,
+                frame,
+                encode_progress.as_ref(),
+                &stop_signal,
+            ) {
                 stop_signal.store(true, Ordering::SeqCst);
                 error_signal.store(true, Ordering::SeqCst);
                 return Err(e);
